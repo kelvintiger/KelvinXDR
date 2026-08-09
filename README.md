@@ -7,9 +7,10 @@ Built for a MacBook Pro 16" (M1 Pro, Liquid Retina XDR) driving two external dis
 
 ## What it does
 
-**Extra brightness on the built-in XDR panel.** A 1×1 pixel EDR surface puts the display
-into HDR mode, and the gamma transfer table spends the headroom that opens up. Up to
-~1.59× above normal SDR white.
+**Extra brightness on the built-in XDR panel.** One slider, 0–159%. Below 100% it drives the
+real backlight. At 100% the backlight pins at maximum and a 1×1 pixel EDR surface puts the
+display into HDR mode, so the gamma transfer table can spend the headroom that opens up —
+up to ~1.59× above normal SDR white. Crossing 100% is what engages XDR; there is no toggle.
 
 **External monitors over DDC/CI.** Real hardware brightness, contrast, volume and mute —
 the same settings the monitor's own buttons change, not a software dim.
@@ -21,8 +22,9 @@ the pointer is on, with an on-screen indicator on that display.
 own minimum, down to black. Displays with neither DDC nor a gamma table (AirPlay, Sidecar,
 DisplayLink) fall back to a shade overlay.
 
-**Steps aside for HDR video.** While an excluded app is frontmost — `com.apple.TV` by
-default — the boost releases so the app's own HDR playback owns the display's headroom.
+**Steps aside on request.** The exclusion list is empty by default: a single corner pixel
+cannot cover anything, so there is nothing to step aside from. Name an app in it and the
+boost releases while that app is frontmost.
 
 ## Why one pixel
 
@@ -87,7 +89,8 @@ defaults write com.kelvin.KelvinXDR ExcludedBundleIDs -array com.apple.TV
 defaults write com.kelvin.KelvinXDR TriggerCorner -string bottomRight   # or topLeft, etc.
 ```
 
-Empty the exclusion array to never step aside.
+The exclusion array is empty by default; populate it to release the boost while a given app
+is frontmost.
 
 ## Recovery
 

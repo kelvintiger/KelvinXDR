@@ -16,12 +16,15 @@ final class OSD {
     private var window: NSWindow?
     private var icon: NSImageView?
     private var fill: NSView?
+    private var notch: NSView?
     private var hideWorkItem: DispatchWorkItem?
 
     private let size = NSSize(width: 220, height: 56)
 
     /// - value: 0...1, or nil for a stateless indicator such as mute.
-    func show(on screen: NSScreen, symbol: String, value: Double?) {
+    /// - mark: 0...1 position of a reference line on the track, or nil for none. The built-in
+    ///   panel uses it to show where 100% sits on a scale that keeps going to 159%.
+    func show(on screen: NSScreen, symbol: String, value: Double?, mark: Double? = nil) {
         let window = self.window ?? makeWindow()
 
         icon?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
@@ -29,6 +32,13 @@ final class OSD {
 
         let trackWidth = size.width - 76
         fill?.frame.size.width = trackWidth * CGFloat(min(max(value ?? 1, 0), 1))
+
+        if let mark = mark {
+            notch?.isHidden = false
+            notch?.frame.origin.x = trackWidth * CGFloat(min(max(mark, 0), 1)) - 1
+        } else {
+            notch?.isHidden = true
+        }
 
         // Top-centre, clear of the menu bar and the notch on displays that have one.
         let frame = screen.frame
@@ -88,10 +98,20 @@ final class OSD {
         fillView.layer?.cornerRadius = 3
         track.addSubview(fillView)
 
+        // Reference line, taller than the track so it reads as a boundary rather than part of
+        // the fill. Sits above it, so crossing 100% visibly runs past the mark.
+        let notchView = NSView(frame: NSRect(x: 0, y: -3, width: 2, height: 12))
+        notchView.wantsLayer = true
+        notchView.layer?.backgroundColor = NSColor.white.cgColor
+        notchView.layer?.cornerRadius = 1
+        notchView.isHidden = true
+        track.addSubview(notchView)
+
         window.contentView = blur
         self.window = window
         self.icon = iconView
         self.fill = fillView
+        self.notch = notchView
         return window
     }
 }

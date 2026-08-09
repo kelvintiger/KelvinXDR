@@ -20,7 +20,10 @@ final class MediaKeys {
     /// Return true if handled — the key event is then swallowed so macOS does not also act
     /// on it. Return false to let it through (e.g. brightness on the built-in panel, which
     /// macOS already does natively and better).
-    typealias Handler = (Key, NSScreen) -> Bool
+    ///
+    /// The Bool is macOS's Option+Shift fine-adjust. Since a handled key is swallowed, the
+    /// system never sees the combination, so we have to honour it ourselves or it is lost.
+    typealias Handler = (Key, NSScreen, Bool) -> Bool
 
     // NX_KEYTYPE_* from IOKit/hidsystem/ev_keymap.h
     private static let nxSoundUp: Int = 0
@@ -116,6 +119,9 @@ final class MediaKeys {
         guard let screen = NSScreen.screens.first(where: { NSMouseInRect(cursor, $0.frame, false) })
                 ?? NSScreen.main else { return passThrough }
 
-        return handler(key, screen) ? nil : passThrough
+        let modifiers = nsEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let fine = modifiers.isSuperset(of: [.option, .shift])
+
+        return handler(key, screen, fine) ? nil : passThrough
     }
 }

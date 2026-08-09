@@ -19,7 +19,8 @@ swiftc -O \
     -o "$APP/Contents/MacOS/KelvinXDR" \
     KelvinXDR/main.swift KelvinXDR/AppDelegate.swift KelvinXDR/EDRTrigger.swift \
     KelvinXDR/GammaBoost.swift KelvinXDR/DDC.swift KelvinXDR/MediaKeys.swift KelvinXDR/OSD.swift \
-    KelvinXDR/AppleBrightness.swift KelvinXDR/Shade.swift KelvinXDR/DisplayControl.swift
+    KelvinXDR/AppleBrightness.swift KelvinXDR/Shade.swift KelvinXDR/DisplayControl.swift \
+    KelvinXDR/AudioOutput.swift KelvinXDR/Detent.swift
 
 # Start from the repo's Info.plist (LSUIElement) and add the keys Xcode would generate
 cp KelvinXDR/Info.plist "$APP/Contents/Info.plist"
