@@ -1,0 +1,154 @@
+# KelvinXDR
+
+Brightness control for macOS: XDR/HDR extra brightness on the built-in panel, plus
+hardware brightness, contrast and volume for external monitors over DDC/CI.
+
+Built for a MacBook Pro 16" (M1 Pro, Liquid Retina XDR) driving two external displays.
+
+## What it does
+
+**Extra brightness on the built-in XDR panel.** A 1×1 pixel EDR surface puts the display
+into HDR mode, and the gamma transfer table spends the headroom that opens up. Up to
+~1.59× above normal SDR white.
+
+**External monitors over DDC/CI.** Real hardware brightness, contrast, volume and mute —
+the same settings the monitor's own buttons change, not a software dim.
+
+**Media keys follow your cursor.** Brightness and volume keys apply to whichever display
+the pointer is on, with an on-screen indicator on that display.
+
+**Software dimming below the hardware floor.** Gamma dimming continues past a monitor's
+own minimum, down to black. Displays with neither DDC nor a gamma table (AirPlay, Sidecar,
+DisplayLink) fall back to a shade overlay.
+
+**Steps aside for HDR video.** While an excluded app is frontmost — `com.apple.TV` by
+default — the boost releases so the app's own HDR playback owns the display's headroom.
+
+## Why one pixel
+
+The obvious implementation is a full-screen transparent layer with a multiply blend, which
+is what this project originally was. It breaks on protected video.
+
+Multiply requires the compositor to read the backdrop. Fullscreen HDR video on Apple TV+ is
+decoded into protected memory and scanned out on a dedicated hardware overlay plane, which
+the compositor is not permitted to read. The blend can't be evaluated, so it degrades to
+normal compositing — and a white layer at alpha 1.0 becomes an opaque white box over the
+video.
+
+A single pixel in a corner can't cover anything, and gamma is applied at scanout after
+compositing, so it brightens protected planes too. Both problems disappear by construction.
+
+## Building
+
+No Xcode required — the Command Line Tools are enough.
+
+```bash
+./build.sh          # build
+./build.sh run      # build and relaunch
+```
+
+### App icon
+
+`build.sh` looks for `KelvinXDR/AppIcon.png` and generates the `.icns` from it, masked to
+Apple's rounded-square icon grid. Replace it with any square PNG to use your own; without
+one, the app falls back to the default icon.
+
+Install with:
+
+```bash
+cp -R build/KelvinXDR.app /Applications/
+```
+
+### Signing
+
+`build.sh` uses a self-signed identity named `KelvinXDR Signing` if one exists, and falls
+back to ad-hoc. This matters: macOS binds an Accessibility grant (needed for the media-key
+event tap) to the app's code signature, and an ad-hoc signature is pinned to the exact
+binary hash — so every rebuild silently revokes the permission. A stable identity fixes it
+permanently:
+
+```bash
+openssl req -new -x509 -days 3650 -nodes -newkey rsa:2048 \
+  -keyout cs.key -out cs.crt -subj "/CN=KelvinXDR Signing" \
+  -addext "basicConstraints=critical,CA:false" \
+  -addext "keyUsage=critical,digitalSignature" \
+  -addext "extendedKeyUsage=critical,codeSigning"
+security import cs.key -k ~/Library/Keychains/login.keychain-db -T /usr/bin/codesign
+security import cs.crt -k ~/Library/Keychains/login.keychain-db -T /usr/bin/codesign
+security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db cs.crt
+```
+
+## Settings
+
+Everything lives in the menu bar. A few things are defaults-only:
+
+```bash
+defaults write com.kelvin.KelvinXDR ExcludedBundleIDs -array com.apple.TV
+defaults write com.kelvin.KelvinXDR TriggerCorner -string bottomRight   # or topLeft, etc.
+```
+
+Empty the exclusion array to never step aside.
+
+## Recovery
+
+Gamma is system-wide state. If the app is killed in a way that skips its handlers and the
+screen is left scaled, this restores it — the signal handler hands every display back to
+ColorSync:
+
+```bash
+killall KelvinXDR
+```
+
+## Requirements
+
+Apple Silicon Mac with an XDR display for the brightness boost. DDC control works with any
+external monitor that implements it — though docks, HDMI extenders and matrix switchers
+often drop the I2C channel, in which case the gamma fallback takes over.
+
+Uses private, undocumented APIs (`IOAVService*` for I2C, `DisplayServices` for the native
+backlight). Apple can change these at any time.
+
+## Credits
+
+KelvinXDR is a derivative of [BrightXDR](https://github.com/starkdmi/BrightXDR) by Dmitry
+Starkov (GPL-3.0), and is GPL-3.0 accordingly.
+
+- **[BrightXDR](https://github.com/starkdmi/BrightXDR)** (GPL-3.0) — the original EDR
+  overlay this project grew out of.
+- **[BrightIntosh](https://github.com/niklasr22/BrightIntosh)** (GPL-3.0) — the pairing of
+  a tiny EDR trigger window with gamma-table brightness, and the reference gamma constants
+  for Apple XDR panels.
+- **[MonitorControl](https://github.com/MonitorControl/MonitorControl)** (MIT) — the Apple
+  Silicon DDC/CI implementation in `DDC.swift` is ported from their `Arm64DDC.swift`,
+  including the IORegistry traversal and the I2C retry timings. MIT license text below.
+
+### MonitorControl (MIT)
+
+```
+Copyright © MonitorControl. @JoniVR, @theOneyouseek, @waydabber and others
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this
+software and associated documentation files (the "Software"), to deal in the Software
+without restriction, including without limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons
+to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or
+substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE
+FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
+
+## License
+
+GPL-3.0. See [LICENSE.md](LICENSE.md).
+
+If you want a maintained app instead of a personal one, use
+[BrightIntosh](https://github.com/niklasr22/BrightIntosh) for XDR brightness or
+[MonitorControl](https://github.com/MonitorControl/MonitorControl) for display control.
+Both are excellent and this borrows heavily from both.
