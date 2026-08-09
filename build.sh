@@ -2,16 +2,36 @@
 # Build KelvinXDR.app without Xcode — needs only the Command Line Tools (swiftc + SDK).
 #   ./build.sh          build
 #   ./build.sh run      build, then relaunch
+#   ./build.sh test     run the hardware-free logic checks
+#
+# Set STRICT=1 to fail the build on warnings (CI does).
 set -euo pipefail
 cd "$(dirname "$0")"
 
 APP="build/KelvinXDR.app"
 BUNDLE_ID="com.kelvin.KelvinXDR"
+# Plain string, not an array: macOS ships bash 3.2, where expanding an empty array under
+# `set -u` is an unbound-variable error.
+STRICT_FLAGS=""
+if [ "${STRICT:-}" = "1" ]; then STRICT_FLAGS="-warnings-as-errors"; fi
+
+# Only the pure logic — everything else needs an XDR panel, an I2C bus or an Accessibility
+# grant. Deliberately narrow rather than mocked: a mock of a private display API would test
+# the mock. See Tests/main.swift.
+if [ "${1:-}" = "test" ]; then
+    mkdir -p build
+    swiftc $STRICT_FLAGS \
+        -sdk "$(xcrun --show-sdk-path)" \
+        -target "$(uname -m)-apple-macos13.1" \
+        -o build/KelvinXDRTests \
+        Tests/main.swift KelvinXDR/Detent.swift KelvinXDR/AudioOutput.swift
+    exec build/KelvinXDRTests
+fi
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-swiftc -O \
+swiftc -O $STRICT_FLAGS \
     -sdk "$(xcrun --show-sdk-path)" \
     -target "$(uname -m)-apple-macos13.1" \
     -import-objc-header KelvinXDR/Bridging.h \

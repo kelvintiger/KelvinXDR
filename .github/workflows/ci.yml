@@ -1,0 +1,32 @@
+# A macOS runner is a headless VM: no XDR panel, no I2C bus, no Accessibility grant. So this
+# cannot exercise the boost, DDC, the media-key tap or the shade fallback — those need real
+# hardware and are checked by hand. What CI is good for here is catching the two things that
+# break silently: a build that stopped compiling, and a regression in the pure logic.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # STRICT=1 turns warnings into errors. A CoreAudio ownership bug reached us as nothing
+      # more than a warning once, so they are worth failing on.
+      - name: Build
+        run: STRICT=1 ./build.sh
+
+      - name: Logic checks
+        run: STRICT=1 ./build.sh test
+
+      # The runner has no "KelvinXDR Signing" identity, so build.sh falls back to ad-hoc.
+      # Fine for CI — that signature is only load-bearing for TCC grants on a real machine.
+      - name: Confirm the app bundle is well-formed
+        run: |
+          codesign --verify --verbose build/KelvinXDR.app
+          test -f build/KelvinXDR.app/Contents/MacOS/KelvinXDR
+          /usr/libexec/PlistBuddy -c "Print :LSUIElement" build/KelvinXDR.app/Contents/Info.plist
