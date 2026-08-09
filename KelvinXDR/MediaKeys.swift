@@ -17,13 +17,45 @@ final class MediaKeys {
         case brightnessUp, brightnessDown, volumeUp, volumeDown, mute
     }
 
-    /// Return true if handled — the key event is then swallowed so macOS does not also act
-    /// on it. Return false to let it through (e.g. brightness on the built-in panel, which
-    /// macOS already does natively and better).
+    /// What macOS itself does with a media key under each modifier combination.
     ///
-    /// The Bool is macOS's Option+Shift fine-adjust. Since a handled key is swallowed, the
-    /// system never sees the combination, so we have to honour it ourselves or it is lost.
-    typealias Handler = (Key, NSScreen, Bool) -> Bool
+    /// Every one of these has to be reimplemented rather than inherited: a swallowed key never
+    /// reaches the system, so any behaviour we do not reproduce is simply lost. Option-alone
+    /// was the regression that prompted this — we consumed the key and stepped the value where
+    /// macOS would have opened System Settings.
+    enum Adjustment: Equatable {
+        /// No modifier: one 1/16 notch, with the feedback click if it is switched on.
+        case coarse
+        /// ⌥⇧: a quarter notch, 1/64.
+        case fine
+        /// ⌥ alone: open the relevant System Settings pane and change nothing.
+        case openSettings
+        /// ⇧ alone: one notch, with the feedback-sound setting *inverted* for this press —
+        /// silent when the click is on, audible when it is off.
+        case coarseInvertedFeedback
+    }
+
+    /// Pure so it can be checked without an event tap; see Tests/main.swift.
+    ///
+    /// Only Option and Shift participate. Command and Control are ignored rather than
+    /// rejected, matching macOS: ⌘⇧ volume-up still steps and still inverts the click.
+    static func adjustment(for modifiers: NSEvent.ModifierFlags) -> Adjustment {
+        switch (modifiers.contains(.option), modifiers.contains(.shift)) {
+        case (true, true):   return .fine
+        case (true, false):  return .openSettings
+        case (false, true):  return .coarseInvertedFeedback
+        case (false, false): return .coarse
+        }
+    }
+
+    /// Return true if handled — the key event is then swallowed so macOS does not also act
+    /// on it. Return false to let it through (e.g. volume for a device we cannot drive,
+    /// which macOS adjusts natively; built-in brightness is deliberately always handled —
+    /// the 0...159% ladder only exists because we own the key).
+    ///
+    /// The whole modifier set is passed, not a pre-digested flag: the handler needs to tell
+    /// ⌥ (open settings) from ⌥⇧ (fine step) from ⇧ (invert the click), and a Bool cannot.
+    typealias Handler = (Key, NSScreen, NSEvent.ModifierFlags) -> Bool
 
     // NX_KEYTYPE_* from IOKit/hidsystem/ev_keymap.h
     private static let nxSoundUp: Int = 0
@@ -78,15 +110,6 @@ final class MediaKeys {
         return true
     }
 
-    func stop() {
-        if let runLoopSource = runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
-        }
-        if let tap = tap { CGEvent.tapEnable(tap: tap, enable: false) }
-        runLoopSource = nil
-        tap = nil
-    }
-
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         // The system disables a tap that takes too long; re-arm it rather than dying quietly.
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
@@ -120,8 +143,7 @@ final class MediaKeys {
                 ?? NSScreen.main else { return passThrough }
 
         let modifiers = nsEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        let fine = modifiers.isSuperset(of: [.option, .shift])
 
-        return handler(key, screen, fine) ? nil : passThrough
+        return handler(key, screen, modifiers) ? nil : passThrough
     }
 }

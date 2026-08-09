@@ -26,6 +26,9 @@ final class Shade {
         let window = windows[id] ?? make(on: screen, id: id)
         window.setFrame(screen.frame, display: false)
         window.alphaValue = alpha
+        // Re-asserted per show — a fullscreen Space can adopt the window (see OSD.show), and
+        // a shade that only dims one Space is a shade that silently stopped working.
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         window.orderFrontRegardless()
     }
 

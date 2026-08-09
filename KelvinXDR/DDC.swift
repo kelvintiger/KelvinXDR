@@ -50,6 +50,11 @@ enum DDC {
         let framebuffers = ["AppleCLCD2", "IOMobileFramebufferShim"]
 
         while let (name, entry) = nextEntry(matching: ["DCPAVServiceProxy"] + framebuffers, iterator: &iterator) {
+            // One release covering every path out of the loop body, `continue` included.
+            // IOAVServiceCreateWithService takes its own reference, so handing the entry back
+            // here does not invalidate the service we keep.
+            defer { IOObjectRelease(entry) }
+
             if framebuffers.contains(name) {
                 current = (0, "")
                 if let attrs = property(entry, "DisplayAttributes") as? NSDictionary,
@@ -81,9 +86,17 @@ enum DDC {
 
         while true {
             let entry = IOIteratorNext(iterator)
-            guard entry != MACH_PORT_NULL, IORegistryEntryGetName(entry, buffer) == KERN_SUCCESS else { return nil }
+            guard entry != MACH_PORT_NULL else { return nil }
+            guard IORegistryEntryGetName(entry, buffer) == KERN_SUCCESS else {
+                IOObjectRelease(entry)
+                return nil
+            }
             let name = String(cString: buffer)
-            for interest in interests where name.contains(interest) { return (name, entry) }
+            // IOIteratorNext hands back a retained object every time. The caller releases the
+            // ones we return; anything we skip has to be released here or the port table grows
+            // on every call, and this runs again on every hotplug.
+            if interests.contains(where: { name.contains($0) }) { return (name, entry) }
+            IOObjectRelease(entry)
         }
     }
 
@@ -93,8 +106,22 @@ enum DDC {
         var send: [UInt8] = [command]
         var reply = [UInt8](repeating: 0, count: 11)
         guard communicate(service, send: &send, reply: &reply) else { return nil }
-        return (UInt16(reply[8]) * 256 + UInt16(reply[9]),
-                UInt16(reply[6]) * 256 + UInt16(reply[7]))
+        return parseReply(reply, command: command)
+    }
+
+    /// Validate and unpack a Get-VCP-Feature reply. Internal so the hardware-free tests can
+    /// exercise it with synthetic replies.
+    ///
+    /// A checksum-valid reply can still be the wrong one: a non-zero result code (byte 3)
+    /// means "unsupported VCP" and arrives zero-filled — parsed blindly, that put a volume
+    /// row on speakerless monitors and quantised brightness to a max of 1. The opcode echo
+    /// (byte 4) catches a reply consumed off the bus for a *different* request. And max == 0
+    /// is never a usable scale, whatever the monitor meant by it.
+    static func parseReply(_ reply: [UInt8], command: UInt8) -> (current: UInt16, max: UInt16)? {
+        guard reply.count == 11, reply[3] == 0, reply[4] == command else { return nil }
+        let maxValue = UInt16(reply[6]) * 256 + UInt16(reply[7])
+        guard maxValue > 0 else { return nil }
+        return (UInt16(reply[8]) * 256 + UInt16(reply[9]), maxValue)
     }
 
     /// - retries: 0 during a smooth transition — an intermediate frame that misses is
@@ -154,12 +181,37 @@ enum DDC {
 
     static let writer = Writer()
 
+    /// One lock per I2C service: a DDC exchange is a stateful write-sleep-read on a single
+    /// bus address, and the refresh scan's reads run on a different thread from the Writer's
+    /// drains. Interleaving two exchanges crosses their replies — the opcode check in
+    /// `parseReply` *detects* that; this prevents it. Per service rather than one global
+    /// lock so different displays still never wait on each other (the Writer's whole design).
+    ///
+    /// Entries are never pruned: a handful of NSLocks per hotplug is noise, and a reused
+    /// object identity at worst shares a lock, which only over-serialises.
+    private static let busLocksLock = NSLock()
+    private static var busLocks: [ObjectIdentifier: NSLock] = [:]
+
+    private static func busLock(for service: IOAVService) -> NSLock {
+        busLocksLock.lock()
+        defer { busLocksLock.unlock() }
+        let key = ObjectIdentifier(service as AnyObject)
+        if let lock = busLocks[key] { return lock }
+        let lock = NSLock()
+        busLocks[key] = lock
+        return lock
+    }
+
     private static func communicate(_ service: IOAVService, send: inout [UInt8], reply: inout [UInt8],
                                     retries: Int = 4) -> Bool {
         var packet: [UInt8] = [UInt8(0x80 | (send.count + 1)), UInt8(send.count)] + send + [0]
         packet[packet.count - 1] = checksum(
             send.count == 1 ? sevenBitAddress << 1 : sevenBitAddress << 1 ^ dataAddress,
             &packet, 0, packet.count - 2)
+
+        let lock = busLock(for: service)
+        lock.lock()
+        defer { lock.unlock() }
 
         var success = false
         for _ in 0...max(retries, 0) {

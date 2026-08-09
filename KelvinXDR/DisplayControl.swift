@@ -88,12 +88,39 @@ final class ManagedDisplay {
 final class DisplayController {
     private let shade = Shade()
     /// Bumped per display to cancel an in-flight transition when a newer one starts.
+    ///
+    /// Guarded by a lock rather than the serial `queue`, deliberately: the whole point is that
+    /// a new call preempts a ramp already running *on* that queue, so a bump enqueued behind
+    /// the ramp could never cancel it. The lock is the only way both sides can touch this
+    /// while one of them is mid-loop.
     private var generation: [CGDirectDisplayID: Int] = [:]
+    private let generationLock = NSLock()
+
+    private func nextGeneration(_ id: CGDirectDisplayID) -> Int {
+        generationLock.lock()
+        defer { generationLock.unlock() }
+        let next = (generation[id] ?? 0) + 1
+        generation[id] = next
+        return next
+    }
+
+    private func isCurrent(_ id: CGDirectDisplayID, _ value: Int) -> Bool {
+        generationLock.lock()
+        defer { generationLock.unlock() }
+        return generation[id] == value
+    }
     private let queue = DispatchQueue(label: "KelvinXDR.displaycontrol", qos: .userInitiated)
 
     var smooth = true
 
+    /// Call on the main thread.
+    ///
+    /// `display.brightness` is read and written here without a lock, which is safe only because
+    /// every caller is a UI action, the media-key tap or the hotkey handler — all main. Two
+    /// concurrent callers on different threads would race on it. The `generation` counter is
+    /// separately locked because the ramp closure genuinely does touch it from another thread.
     func set(_ display: ManagedDisplay, brightness value: Double, screen: NSScreen?, animated: Bool? = nil) {
+        dispatchPrecondition(condition: .onQueue(.main))
         let target = min(max(value, 0), 1)
         let from = display.brightness
         display.brightness = target
@@ -103,8 +130,7 @@ final class DisplayController {
         // intermediate steps anyway. Ramping is for the instant paths: Apple-native and gamma.
         let canAnimate = display.ddcService == nil
         let shouldAnimate = canAnimate && (animated ?? smooth) && abs(target - from) > 0.02
-        let generationNow = (generation[display.id] ?? 0) + 1
-        generation[display.id] = generationNow
+        let generationNow = nextGeneration(display.id)
 
         guard shouldAnimate else {
             queue.async { self.write(display, target, screen: screen, fast: false) }
@@ -116,7 +142,7 @@ final class DisplayController {
         let steps = display.ddcService != nil ? 4 : 12
         queue.async {
             for step in 1...steps {
-                guard self.generation[display.id] == generationNow else { return }
+                guard self.isCurrent(display.id, generationNow) else { return }
                 let t = Double(step) / Double(steps)
                 let eased = 1 - pow(1 - t, 3)
                 self.write(display, from + (target - from) * eased, screen: screen, fast: step < steps)
@@ -142,20 +168,20 @@ final class DisplayController {
         // the gamma table belongs to the XDR boost, so touching it here would wipe it.
         guard display.softwareFraction > 0 else { return }
 
-        DispatchQueue.main.async {
-            switch display.software {
-            case .gamma:
-                // 1.0 means "leave it alone" — GammaBoost restores rather than scaling by 1.
-                GammaBoost.apply(factor: Float(software), to: display.id)
-            case .shade:
+        switch display.software {
+        case .gamma:
+            // 1.0 means "leave it alone" — GammaBoost restores rather than scaling by 1.
+            // Applied directly on this queue: GammaBoost is internally locked, and the old
+            // main-queue hop predated that lock — the status menu's tracking loop starves
+            // the main queue, which froze gamma-dimmed displays mid-drag until menu close.
+            GammaBoost.apply(factor: Float(software), to: display.id)
+        case .shade:
+            // AppKit windows are main-thread-only, so the shade keeps the hop. It still lags
+            // while a menu is open — accepted for the AirPlay/Sidecar fallback tier.
+            DispatchQueue.main.async {
                 if let screen = screen { self.shade.apply(level: CGFloat(software), to: screen) }
             }
         }
-    }
-
-    func clearSoftware(_ display: ManagedDisplay) {
-        GammaBoost.restore(display.id)
-        shade.remove(display.id)
     }
 
     func clearAll() {

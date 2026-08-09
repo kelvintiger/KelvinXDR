@@ -19,6 +19,18 @@ import Cocoa
 enum GammaBoost {
     private static let tableSize: UInt32 = 256
 
+    /// Guards every static below, and the CGSetDisplayTransferByTable calls that read them.
+    ///
+    /// The termination handlers run on a global queue while the main thread may be part-way
+    /// through `apply`. Without this, `restoreAll` could hand the display back, the main thread
+    /// could then finish writing its scaled table, and `exit(0)` would leave the screen at
+    /// 1.59x until logout — precisely what those handlers exist to prevent.
+    private static let lock = NSLock()
+
+    /// Set once a termination handler has restored. Any `apply` that arrives afterwards is a
+    /// write we must not perform, because nothing will run to undo it.
+    private static var terminating = false
+
     /// Untouched table per display. Every apply scales from this, never from the current
     /// table, or repeated applies compound into a white screen.
     private static var base: [CGDirectDisplayID: (r: [CGGammaValue], g: [CGGammaValue], b: [CGGammaValue])] = [:]
@@ -54,7 +66,42 @@ enum GammaBoost {
     /// - factor: 1.0 leaves the display alone. Above 1.0 boosts into EDR headroom, below 1.0
     ///           dims, 0.0 is black.
     static func apply(factor: Float, to display: CGDirectDisplayID) {
-        guard factor != 1.0 else { restore(display); return }
+        lock.lock()
+        defer { lock.unlock() }
+        applyLocked(factor: factor, to: display)
+    }
+
+    /// Put one display back. There is no per-display restore in CoreGraphics, so this
+    /// rewrites the captured baseline rather than resetting everything.
+    static func restore(_ display: CGDirectDisplayID) {
+        lock.lock()
+        defer { lock.unlock() }
+        restoreLocked(display)
+    }
+
+    /// Hand every display back to ColorSync. Must run before exit or screens stay scaled.
+    static func restoreAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        restoreAllLocked()
+    }
+
+    /// Restore and then refuse all further writes. For the signal handlers: an `apply` already
+    /// in flight on another thread finishes first (it holds the lock), and any that arrives
+    /// afterwards sees `terminating` and does nothing, so the last write to the hardware is
+    /// always the restore.
+    static func prepareForTermination() {
+        lock.lock()
+        defer { lock.unlock() }
+        restoreAllLocked()
+        terminating = true
+    }
+
+    // MARK: - Lock held
+
+    private static func applyLocked(factor: Float, to display: CGDirectDisplayID) {
+        guard !terminating else { return }
+        guard factor != 1.0 else { restoreLocked(display); return }
         guard captureBaseIfNeeded(display), let base = base[display] else { return }
 
         var r = base.r.map { $0 * factor }
@@ -66,16 +113,13 @@ enum GammaBoost {
         }
     }
 
-    /// Put one display back. There is no per-display restore in CoreGraphics, so this
-    /// rewrites the captured baseline rather than resetting everything.
-    static func restore(_ display: CGDirectDisplayID) {
+    private static func restoreLocked(_ display: CGDirectDisplayID) {
         guard active.contains(display), var base = base[display] else { return }
         CGSetDisplayTransferByTable(display, tableSize, &base.r, &base.g, &base.b)
         active.remove(display)
     }
 
-    /// Hand every display back to ColorSync. Must run before exit or screens stay scaled.
-    static func restoreAll() {
+    private static func restoreAllLocked() {
         CGDisplayRestoreColorSyncSettings()
         active.removeAll()
     }
@@ -88,7 +132,11 @@ enum GammaBoost {
     /// the scaled table as the new baseline and multiplies on top of it — 1.59 becomes 2.53,
     /// and the screen washes out.
     static func invalidate() {
-        restoreAll()
+        lock.lock()
+        defer { lock.unlock() }
+        // restoreAllLocked, not restoreAll: NSLock is not recursive, so calling the public
+        // entry point from here would deadlock.
+        restoreAllLocked()
         base.removeAll()
         // Force a fresh ColorSync reset before the next capture, belt-and-braces.
         didResetOnce = false

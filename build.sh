@@ -20,11 +20,16 @@ if [ "${STRICT:-}" = "1" ]; then STRICT_FLAGS="-warnings-as-errors"; fi
 # the mock. See Tests/main.swift.
 if [ "${1:-}" = "test" ]; then
     mkdir -p build
+    # The bridging header + IOKit are for DDC.swift, whose reply parser is pure logic worth
+    # checking; the I2C entry points it also declares resolve from the SDK's IOKit stubs.
     swiftc $STRICT_FLAGS \
         -sdk "$(xcrun --show-sdk-path)" \
         -target "$(uname -m)-apple-macos13.1" \
+        -import-objc-header KelvinXDR/Bridging.h \
+        -framework IOKit \
         -o build/KelvinXDRTests \
-        Tests/main.swift KelvinXDR/Detent.swift KelvinXDR/AudioOutput.swift
+        Tests/main.swift KelvinXDR/Detent.swift KelvinXDR/AudioOutput.swift KelvinXDR/Shortcuts.swift KelvinXDR/Settings.swift KelvinXDR/GammaBoost.swift \
+        KelvinXDR/MediaKeys.swift KelvinXDR/PercentField.swift KelvinXDR/OSD.swift KelvinXDR/DDC.swift
     exec build/KelvinXDRTests
 fi
 
@@ -40,7 +45,9 @@ swiftc -O $STRICT_FLAGS \
     KelvinXDR/main.swift KelvinXDR/AppDelegate.swift KelvinXDR/EDRTrigger.swift \
     KelvinXDR/GammaBoost.swift KelvinXDR/DDC.swift KelvinXDR/MediaKeys.swift KelvinXDR/OSD.swift \
     KelvinXDR/AppleBrightness.swift KelvinXDR/Shade.swift KelvinXDR/DisplayControl.swift \
-    KelvinXDR/AudioOutput.swift KelvinXDR/Detent.swift
+    KelvinXDR/AudioOutput.swift KelvinXDR/Detent.swift \
+    KelvinXDR/Shortcuts.swift KelvinXDR/Settings.swift \
+    KelvinXDR/SystemOSD.swift KelvinXDR/PercentField.swift
 
 # Start from the repo's Info.plist (LSUIElement) and add the keys Xcode would generate
 cp KelvinXDR/Info.plist "$APP/Contents/Info.plist"

@@ -24,6 +24,16 @@ enum Detent {
     static let notchesToMax: Float = 16
 
     /// Light multiplier per notch above 50%, measured via DisplayServicesGetLinearBrightness.
+    ///
+    /// Hardcoded on purpose. This is a macOS curve, not a panel calibration: the ratio is
+    /// identical to four decimal places across all eight notches from 50% to 100%, and the
+    /// knee sits at exactly notch 8. A per-panel measurement would drift; a designed curve
+    /// does not. Deriving it at runtime would also mean stepping the backlight through two
+    /// notches at launch, which the user would see.
+    ///
+    /// To re-measure on another Mac: read DisplayServicesGetBrightness and
+    /// DisplayServicesGetLinearBrightness at each notch n/16, then take the ratio of
+    /// successive linear values above 0.5.
     static let xdrRatio: Float = 1.1725
 
     /// Slider value -> notch coordinate. The two branches agree at 1.0 (both give 16), so the

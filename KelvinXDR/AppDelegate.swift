@@ -4,12 +4,33 @@
 //
 
 import Cocoa
+import CoreAudio
 import ServiceManagement
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    // MacBookPro18,1 built-in XDR. BrightIntosh's reference bonus gamma for this panel class
-    // is 0.59, so 159% is the ceiling — past that you are only clipping highlights.
-    private let maxLevel: Float = 1.59
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    /// Absolute cap on the gamma boost: BrightIntosh's reference bonus gamma for Apple XDR
+    /// panels is 0.59, and past 159% you are only clipping highlights.
+    ///
+    /// Deliberately not derived from the panel's reported headroom. This MacBook reports a
+    /// *potential* 16.0, which is the EDR pipeline's theoretical ceiling rather than anything
+    /// the backlight can hold — asking for it would just make macOS throttle. There is no
+    /// public API for sustained full-screen nits, which is what actually bounds this, so a
+    /// conservative constant beats a derived number that would be confidently wrong.
+    private let boostCap: Float = 1.59
+
+    /// The top of this machine's slider: 100% where the panel has no EDR headroom to spend,
+    /// so a Mac without an XDR display gets a plain 0–100% brightness control instead of a
+    /// range whose top third silently does nothing.
+    ///
+    /// `maximumPotential...` is the capability gate rather than the size: it reads 16.0 on the
+    /// built-in XDR panel and exactly 1.0 on both external monitors, and stays put whether or
+    /// not HDR is currently engaged. The `min` only matters for a hypothetical panel with less
+    /// headroom than the cap.
+    private var maxLevel: Float {
+        guard let potential = builtInScreen?.maximumPotentialExtendedDynamicRangeColorComponentValue,
+              potential > 1.05 else { return 1.0 }
+        return min(boostCap, Float(potential))
+    }
 
     private var window: NSWindow!
     private var trigger: EDRTrigger!
@@ -21,7 +42,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var mediaKeys: MediaKeys!
     private let osd = OSD()
+    private let systemOSD = SystemOSD()
     private let controller = DisplayController()
+
+    /// The click the volume keys make. Held rather than rebuilt per press — NSSound re-reads
+    /// the file otherwise, and this one fires on every notch.
+    private lazy var volumeClick: NSSound? = NSSound(
+        contentsOfFile: "/System/Library/LoginPlugins/BezelServices.loginPlugin/Contents/Resources/volume.aiff",
+        byReference: true)
 
     private var displays: [ManagedDisplay] = []
     private var rows: [RowKey: (slider: NSSlider, label: NSTextField)] = [:]
@@ -30,9 +58,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // Empty by default: the 1x1 trigger cannot cover video, so there is nothing to step
     // aside from. Populate it to release the boost while a given app is frontmost.
-    private let excluded = Set(
+    // A var, not a let: the settings window edits it and we re-read on change.
+    private var excluded = Set(
         UserDefaults.standard.stringArray(forKey: "ExcludedBundleIDs") ?? []
     )
+
+    private var shortcuts: Shortcuts!
+    private lazy var settings: SettingsWindowController = {
+        let controller = SettingsWindowController()
+        controller.onChange = { [weak self] in self?.settingsChanged() }
+        controller.isShortcutActive = { [weak self] in self?.shortcuts.isActive($0) ?? false }
+        controller.values = { [weak self] in self?.editableValues() ?? [] }
+        return controller
+    }()
 
     private func flag(_ key: String, default value: Bool) -> Bool {
         UserDefaults.standard.object(forKey: key) as? Bool ?? value
@@ -59,6 +97,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         get { flag("SmoothTransitions", default: true) }
         set { UserDefaults.standard.set(newValue, forKey: "SmoothTransitions"); controller.smooth = newValue }
     }
+    /// Draw level changes in the stock macOS bezel instead of the compact HUD.
+    ///
+    /// Style only. We still own the value and still swallow the key either way — brightness
+    /// has to stay intercepted for the range above 100% whatever the indicator looks like, so
+    /// this is not a passthrough switch and cannot be made into one.
+    private var useSystemHUD: Bool {
+        get { flag("UseSystemHUD", default: false) }
+        set { UserDefaults.standard.set(newValue, forKey: "UseSystemHUD") }
+    }
+
+    /// macOS's "Play feedback when volume is changed", from NSGlobalDomain.
+    ///
+    /// Unset means **off**: macOS only writes the key when the box is ticked. Reading absence
+    /// as "on" made the click play on every single press — which is what the modifier is
+    /// supposed to toggle, not the baseline. Checked against the live domain: the key does not
+    /// exist here and this Mac is silent on a plain volume press.
+    private var volumeFeedback: Bool {
+        UserDefaults.standard.bool(forKey: "com.apple.sound.beep.feedback")
+    }
 
     /// Gamma multiplier above SDR white: 1.0 is no boost, `maxLevel` the ceiling.
     ///
@@ -70,7 +127,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard UserDefaults.standard.object(forKey: "XDRGammaFactor") != nil else { return maxLevel }
             return min(max(UserDefaults.standard.float(forKey: "XDRGammaFactor"), 1.0), maxLevel)
         }
-        set { UserDefaults.standard.set(min(max(newValue, 1.0), maxLevel), forKey: "XDRGammaFactor") }
+        // boostCap, not maxLevel: maxLevel reads 1.0 the moment the built-in screen is gone
+        // (lid closing), and a Sync-All keypress landing in that window would persist 1.0 —
+        // destroying the stored boost exactly the way migrateLegacyPrefs was fixed not to.
+        // The getter clamps reads to live maxLevel, which is all the display-side cap needs.
+        set { UserDefaults.standard.set(min(max(newValue, 1.0), boostCap), forKey: "XDRGammaFactor") }
     }
 
     /// The old scheme stored a 0.30...1.59 gamma factor in `Brightness` alongside an `Enabled`
@@ -85,9 +146,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if defaults.object(forKey: "XDRGammaFactor") == nil {
             let wasEnabled = defaults.object(forKey: "Enabled") as? Bool ?? true
+            // boostCap, not maxLevel: migration reinterprets an old stored value, and must
+            // not depend on which displays happen to be attached right now. Launching docked
+            // in clamshell would otherwise see maxLevel == 1.0, clamp a stored 1.59 to 1.0,
+            // and delete the inputs that could have recovered it.
             let old = defaults.object(forKey: "Brightness") != nil
-                ? defaults.float(forKey: "Brightness") : maxLevel
-            defaults.set(wasEnabled ? min(max(old, 1.0), maxLevel) : 1.0, forKey: "XDRGammaFactor")
+                ? defaults.float(forKey: "Brightness") : boostCap
+            defaults.set(wasEnabled ? min(max(old, 1.0), boostCap) : 1.0, forKey: "XDRGammaFactor")
         }
         defaults.removeObject(forKey: "Brightness")
         defaults.removeObject(forKey: "Enabled")
@@ -95,21 +160,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var builtInDisplay: ManagedDisplay? { displays.first { $0.isBuiltIn } }
 
+    /// How close to maximum the backlight has to be before the slider is considered to be at
+    /// 100% and the XDR half takes over. Shared by the getter and `setLevel`: if only one of
+    /// them knew about the dead band, a value inside it would report as a different number
+    /// than was set.
+    private let backlightMax: Double = 0.99
+
     /// The built-in panel's one control, 0...maxLevel. 1.0 is 100%: backlight at maximum, no
     /// boost. Below that it is the backlight; above it the backlight stays pinned and gamma
     /// spends the EDR headroom. Crossing 100% is what engages XDR.
     private var level: Float {
         guard let builtIn = builtInDisplay else { return xdrFactor }
-        // A backlight below maximum means something outside this app pulled it down, and a
-        // boost is meaningless there — report the backlight and let applyState drop the gamma.
-        return builtIn.brightness < 0.99 ? Float(builtIn.brightness) : xdrFactor
+        // Reads the cached value, which `refreshBuiltInBrightness` pulls back from the hardware
+        // whenever something outside this app moves the backlight. Reading the hardware *here*
+        // was worse: this getter runs in the same main-thread turn as `setLevel`, before the
+        // queued write has reached the panel, so it returned the pre-press value and then
+        // overwrote the freshly-set one with it.
+        //
+        // A backlight below maximum means something pulled it down, and a boost is meaningless
+        // there — report the backlight and let applyState drop the gamma.
+        return builtIn.brightness < backlightMax ? Float(builtIn.brightness) : xdrFactor
     }
 
     private func setLevel(_ value: Float) {
         guard let builtIn = builtInDisplay else { return }
         let target = min(max(value, 0), maxLevel)
 
-        if target >= 1.0 {
+        // `>= backlightMax`, not `>= 1.0`: a value inside the getter's dead band would
+        // otherwise leave the backlight just short of maximum while the slider read 100%.
+        if target >= Float(backlightMax) {
             xdrFactor = target
             // Gamma spends headroom above SDR white, so the panel has to already be at
             // maximum for any of it to show.
@@ -152,11 +231,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func positionTrigger(on screen: NSScreen) {
         let f = screen.frame
         let origin: CGPoint
-        switch UserDefaults.standard.string(forKey: "TriggerCorner") ?? "bottomRight" {
+        switch UserDefaults.standard.string(forKey: "TriggerCorner") ?? "topRight" {
         case "topLeft":     origin = CGPoint(x: f.minX, y: f.maxY - 1)
-        case "topRight":    origin = CGPoint(x: f.maxX - 1, y: f.maxY - 1)
         case "bottomLeft":  origin = CGPoint(x: f.minX, y: f.minY)
-        default:            origin = CGPoint(x: f.maxX - 1, y: f.minY)
+        case "bottomRight": origin = CGPoint(x: f.maxX - 1, y: f.minY)
+        default:            origin = CGPoint(x: f.maxX - 1, y: f.maxY - 1)   // topRight
         }
         window.setFrameOrigin(origin)
     }
@@ -165,7 +244,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
         migrateLegacyPrefs()
+
+        // Observers first, before the screen check below. Launching with no screens yet — a
+        // headless boot, or launch-at-login racing display enumeration — otherwise leaves a
+        // process with no observers and no signal handlers, which can never recover.
+        installTerminationHandlers()
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(frontmostAppChanged),
+            name: NSWorkspace.didActivateApplicationNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(reapply),
+            name: NSWorkspace.didWakeNotification, object: nil)
+        // Waking the displays alone (our own Turn Display Off hotkey does exactly this) never
+        // posts didWake, so the boost would sit unapplied until something else nudged it.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(reapply),
+            name: NSWorkspace.screensDidWakeNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(displaysChanged),
+            name: NSApplication.didChangeScreenParametersNotification, object: nil)
+
+        // No screen yet: everything below needs one, so defer it. `displaysChanged` calls this
+        // again once a display appears. Registering the observers above but leaving these nil
+        // would be worse than the old behaviour, not better — the notifications would fire
+        // into a half-built delegate and dereference nil.
         guard let screen = builtInScreen ?? NSScreen.main else { return }
+        finishLaunch(on: screen)
+    }
+
+    /// True once the deferred setup has run. Everything that a notification can reach has to
+    /// check this, because a notification can arrive before a screen ever does.
+    private var isReady: Bool { window != nil }
+
+    private func finishLaunch(on screen: NSScreen) {
+        guard window == nil else { return }
         controller.smooth = smooth
 
         // A 1x1 window in the top-left corner. Size is the entire point: it cannot overlap
@@ -180,10 +292,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         window.hidesOnDeactivate = false
         window.animationBehavior = .none
-        // Bottom-right corner. It reads as a dead pixel anywhere you can see it, and on this
-        // panel the extreme corner falls inside the display's rounded-corner mask, so it is
-        // hidden outright. Overridable in case a future display has square corners:
-        //   defaults write com.kelvin.KelvinXDR TriggerCorner -string topLeft
+        // Top-right corner by default. It reads as a dead pixel anywhere you can see it, and on
+        // this panel the extreme corner falls inside the display's rounded-corner mask, so it
+        // is hidden outright — and up here it also sits in the menu bar strip rather than over
+        // document content. Changeable in Settings, or:
+        //   defaults write com.kelvin.KelvinXDR TriggerCorner -string bottomRight
         positionTrigger(on: screen)
 
         trigger = EDRTrigger()
@@ -191,25 +304,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 
-        mediaKeys = MediaKeys { [weak self] key, screen, fine in
-            self?.handleMediaKey(key, on: screen, fine: fine) ?? false
+        mediaKeys = MediaKeys { [weak self] key, screen, modifiers in
+            self?.handleMediaKey(key, on: screen, modifiers: modifiers) ?? false
         }
+        shortcuts = Shortcuts { [weak self] action in self?.perform(action) }
+        shortcuts.reload()
+
         mediaKeys.start()
         // Written so the state is checkable from outside without rebuilding the app.
         UserDefaults.standard.set(mediaKeys.isRunning, forKey: "MediaKeysActive")
         pollForTrust()
 
-        installTerminationHandlers()
-
-        NSWorkspace.shared.notificationCenter.addObserver(
-            self, selector: #selector(frontmostAppChanged),
-            name: NSWorkspace.didActivateApplicationNotification, object: nil)
-        NSWorkspace.shared.notificationCenter.addObserver(
-            self, selector: #selector(reapply),
-            name: NSWorkspace.didWakeNotification, object: nil)
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(displaysChanged),
-            name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        // Seed the built-in before the first applyState. The full scan below is async and can
+        // take seconds on a busy I2C bus; with the list empty, `level` falls through to the
+        // persisted boost factor and the panel would run gamma-boosted over whatever the real
+        // backlight is — crushed whites at 40% backlight until the scan lands. The native
+        // brightness read is local and immediate, so the first applyState can see the truth.
+        if let builtIn = builtInScreen, let id = builtIn.displayID {
+            displays = [ManagedDisplay(id: id, name: builtIn.localizedName, isBuiltIn: true,
+                                       hardware: .appleNative, softwareFraction: 0,
+                                       brightness: Double(AppleBrightness.get(id) ?? 1))]
+        }
 
         suspended = excluded.contains(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "")
         rebuildMenu()
@@ -230,7 +345,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // queue, so a kill while the menu is open would skip the restore entirely.
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
             source.setEventHandler {
-                GammaBoost.restoreAll()
+                // Not restoreAll: this runs on a global queue while the main thread may be
+                // part-way through an apply. prepareForTermination takes the same lock and
+                // latches a flag, so an apply already in flight completes first and any that
+                // arrives afterwards is refused — the restore is always the last write.
+                GammaBoost.prepareForTermination()
                 exit(0)
             }
             source.resume()
@@ -240,7 +359,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Displays
 
+    /// Bumped per refresh so a superseded scan cannot commit. Scans run concurrently and a
+    /// scan stalled on a just-unplugged DDC service (its reads retry for seconds) reliably
+    /// finishes *after* a newer, correct scan — last-writer-wins would resurrect the ghost
+    /// display and regress knownDisplays, triggering a spurious gamma invalidate.
+    private var refreshGeneration = 0
+
     private func refreshDisplays() {
+        refreshGeneration += 1
+        let generation = refreshGeneration
         let screens: [(CGDirectDisplayID, String)] = NSScreen.screens.compactMap {
             guard let id = $0.displayID else { return nil }
             return (id, $0.localizedName)
@@ -284,6 +411,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             DispatchQueue.main.async {
+                guard generation == self.refreshGeneration else { return }
                 self.knownDisplays = Set(found.map { $0.id })
                 self.displays = found
                 self.rebuildMenu()
@@ -293,6 +421,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func displaysChanged() {
+        // A display arriving is what completes a launch that had none. Do this before
+        // anything else here touches the deferred objects.
+        if !isReady, let screen = builtInScreen ?? NSScreen.main {
+            finishLaunch(on: screen)
+            return
+        }
         let current = Set(NSScreen.screens.compactMap { $0.displayID })
         // This notification also fires for brightness and colour-profile changes, not only
         // hotplug. Only a genuine change of display set can stale a captured gamma baseline,
@@ -360,58 +494,223 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                          value: UInt16((contrast * Double(display.ddcContrastMax)).rounded()))
     }
 
-    private func handleMediaKey(_ key: MediaKeys.Key, on screen: NSScreen, fine: Bool) -> Bool {
+    private func handleMediaKey(_ key: MediaKeys.Key, on screen: NSScreen,
+                                modifiers: NSEvent.ModifierFlags) -> Bool {
         guard let id = screen.displayID, let target = display(for: id) else { return false }
+        let adjustment = MediaKeys.adjustment(for: modifiers)
+
+        // ⌥ alone is a shortcut into System Settings rather than an adjustment, and we have to
+        // perform it ourselves: the key is swallowed, so macOS never gets its turn. Until this
+        // existed the modifier was ignored and the value stepped instead.
+        if adjustment == .openSettings {
+            switch key {
+            case .brightnessUp, .brightnessDown: openSettingsPane("com.apple.Displays-Settings.extension")
+            case .volumeUp, .volumeDown, .mute:  openSettingsPane("com.apple.Sound-Settings.extension")
+            }
+            return true
+        }
+        let fine = adjustment == .fine
 
         switch key {
         case .brightnessUp, .brightnessDown:
             let up = key == .brightnessUp
             let targets = syncAll ? displays.filter { $0.hasHardware || $0.softwareFraction > 0 } : [target]
+            // Remember what we asked for. Re-reading `level` afterwards would report the value
+            // from before the press, because the backlight write is still queued.
+            var builtInTarget: Float?
             for display in targets {
                 if display.isBuiltIn {
                     // The unified scale runs to 159%, so the keys keep climbing past the top
                     // of the backlight into the XDR range instead of stopping at 100%.
                     // setLevel pins the backlight and re-runs applyState on the way through.
-                    setLevel(Detent.next(from: level, up: up, ceiling: maxLevel, fine: fine))
-                    sync(display, .brightness, Double(level))
+                    let next = Detent.next(from: level, up: up, ceiling: maxLevel, fine: fine)
+                    setLevel(next)
+                    builtInTarget = next
+                    sync(display, .brightness, Double(next))
                 } else {
                     applyBrightness(display, Double(Detent.next(from: Float(display.brightness), up: up, ceiling: 1, fine: fine)))
                     sync(display, .brightness, display.brightness)
                 }
             }
-            if target.isBuiltIn {
-                // Mark where 100% falls on a track that runs to 159%, and switch the glyph
-                // once past it, so crossing into XDR is unmistakable without a readout.
-                osd.show(on: screen, symbol: level > 1.0 ? "sparkles" : "sun.max.fill",
-                         value: Double(level / maxLevel), mark: Double(1.0 / maxLevel))
+            if target.isBuiltIn, let shown = builtInTarget {
+                showBuiltInOSD(on: screen, level: shown)
             } else {
-                osd.show(on: screen, symbol: "sun.max.fill", value: target.brightness)
+                // weak target: hotplug rescans replace the whole display list, and the HUD
+                // stays interactive after the keypress — a strongly-held stale display would
+                // scrub an orphaned model through a dead service.
+                showOSD(on: screen, symbol: "sun.max.fill", image: .brightness,
+                        value: target.brightness,
+                        onScrub: { [weak self, weak target] fraction in
+                            guard let target = target else { return }
+                            self?.scrub(target, to: fraction)
+                        })
             }
             return true
 
         case .volumeUp, .volumeDown:
-            guard let service = target.ddcService, ownsAudio(target) else { return false }
-            target.volume = Double(Detent.next(from: Float(target.volume), up: key == .volumeUp, ceiling: 1, fine: fine))
-            DDC.writer.write(service, display: target.id, command: DDC.volume,
-                             value: UInt16((target.volume * Double(target.ddcVolumeMax)).rounded()))
-            if target.muted, target.volume > 0 {
-                target.muted = false
-                DDC.writer.write(service, display: target.id, command: DDC.mute, value: 2)
+            let up = key == .volumeUp
+
+            // The display genuinely plays the sound: its own register is the one to move.
+            if let service = target.ddcService, ownsAudio(target) {
+                target.volume = Double(Detent.next(from: Float(target.volume), up: up, ceiling: 1, fine: fine))
+                DDC.writer.write(service, display: target.id, command: DDC.volume,
+                                 value: UInt16((target.volume * Double(target.ddcVolumeMax)).rounded()))
+                if target.muted, target.volume > 0 {
+                    target.muted = false
+                    DDC.writer.write(service, display: target.id, command: DDC.mute, value: 2)
+                }
+                sync(target, .volume, target.volume)
+                click(adjustment)
+                showVolumeOSD(on: screen, value: target.volume, muted: target.volume == 0,
+                              onScrub: { [weak self, weak target] fraction in
+                                  guard let target = target else { return }
+                                  self?.scrubVolume(target, to: fraction)
+                              })
+                return true
             }
-            sync(target, .volume, target.volume)
-            osd.show(on: screen, symbol: target.volume == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill",
-                     value: target.volume)
+
+            // It does not — so move the level the user can actually hear. Taking the key and
+            // writing a register nobody is listening to is exactly the bug that had volume
+            // interception removed the first time.
+            guard let device = AudioOutput.defaultDevice,
+                  let current = AudioOutput.volume(of: device) else { return false }
+            let next = Detent.next(from: current, up: up, ceiling: 1, fine: fine)
+            // A readable-but-fixed master level (optical out, some HDMI) passes the guard
+            // above and then refuses the write. Nothing has been written yet, so declining
+            // the key is still clean — macOS drives the device its own way.
+            guard AudioOutput.setVolume(next, on: device) else { return false }
+            // Nudging off zero unmutes, which is what the hardware keys do.
+            if next > 0, AudioOutput.isMuted(device) == true { AudioOutput.setMuted(false, on: device) }
+            click(adjustment)
+            showVolumeOSD(on: screen, value: Double(next), muted: next == 0,
+                          onScrub: { [weak self] fraction in self?.scrubVolume(device, to: fraction) })
             return true
 
         case .mute:
-            guard let service = target.ddcService, ownsAudio(target) else { return false }
-            target.muted.toggle()
-            DDC.writer.write(service, display: target.id, command: DDC.mute,
-                             value: target.muted ? 1 : 2)
-            osd.show(on: screen, symbol: target.muted ? "speaker.slash.fill" : "speaker.wave.2.fill",
-                     value: target.muted ? 0 : target.volume)
+            if let service = target.ddcService, ownsAudio(target) {
+                target.muted.toggle()
+                DDC.writer.write(service, display: target.id, command: DDC.mute,
+                                 value: target.muted ? 1 : 2)
+                showVolumeOSD(on: screen, value: target.muted ? 0 : target.volume,
+                              muted: target.muted, onScrub: nil)
+                return true
+            }
+            // No mute control on the device (optical out, some HDMI) — hand the key back to
+            // macOS rather than faking it by parking the level at zero.
+            guard let device = AudioOutput.defaultDevice,
+                  let muted = AudioOutput.isMuted(device) else { return false }
+            AudioOutput.setMuted(!muted, on: device)
+            showVolumeOSD(on: screen,
+                          value: muted ? Double(AudioOutput.volume(of: device) ?? 0) : 0,
+                          muted: !muted, onScrub: nil)
             return true
         }
+    }
+
+    /// ⌥ + a media key opens the matching System Settings pane, matching what macOS would have
+    /// done with the key we swallowed.
+    private func openSettingsPane(_ identifier: String) {
+        guard let url = URL(string: "x-apple.systempreferences:\(identifier)") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    /// The volume feedback click.
+    ///
+    /// Shift does not simply "play a sound" — it *inverts* the feedback setting for that press,
+    /// so it silences the click when the click is on and plays it when it is off.
+    private func click(_ adjustment: MediaKeys.Adjustment) {
+        let wanted = adjustment == .coarseInvertedFeedback ? !volumeFeedback : volumeFeedback
+        guard wanted, let sound = volumeClick else { return }
+        // Restart rather than overlap: holding the key down should tick, not smear.
+        sound.stop()
+        sound.play()
+    }
+
+    // MARK: - HUD
+
+    /// One place that decides which indicator renders, so every call site gets the toggle free.
+    ///
+    /// - chiclets: overrides the default 16-notch strip on the system bezel. Only the built-in
+    ///   panel needs it, because its scale runs past 100%.
+    private func showOSD(on screen: NSScreen, symbol: String, image: SystemOSD.Image,
+                         value: Double?, mark: Double? = nil,
+                         chiclets: (filled: UInt32, total: UInt32)? = nil,
+                         onScrub: ((Double) -> Void)? = nil) {
+        guard useSystemHUD, let id = screen.displayID else {
+            osd.show(on: screen, symbol: symbol, value: value, mark: mark, onScrub: onScrub)
+            return
+        }
+        guard let value = value else {
+            systemOSD.show(on: id, image: image)
+            return
+        }
+        let strip = chiclets ?? (SystemOSD.chiclets(value), 16)
+        systemOSD.show(on: id, image: image, filled: strip.filled, total: strip.total)
+    }
+
+    /// The built-in panel's indicator: one 0...159% track with the 100% boundary marked, and a
+    /// different glyph past it, so crossing into XDR is unmistakable without a readout.
+    private func showBuiltInOSD(on screen: NSScreen, level shown: Float) {
+        showOSD(on: screen,
+                symbol: shown > 1.0 ? "sparkles" : "sun.max.fill",
+                image: .brightness,
+                value: Double(shown / maxLevel),
+                mark: Double(1.0 / maxLevel),
+                // The strip keeps Apple's 1/16 notch and simply runs longer, so the chiclets
+                // past the 16th *are* the XDR range rather than a rescaled 0...100%.
+                chiclets: (UInt32(max(0, Detent.notch(shown).rounded())),
+                           UInt32(max(1, Detent.notch(maxLevel).rounded()))),
+                onScrub: { [weak self] fraction in self?.scrubBuiltIn(to: fraction) })
+    }
+
+    private func showVolumeOSD(on screen: NSScreen, value: Double, muted: Bool,
+                               onScrub: ((Double) -> Void)?) {
+        showOSD(on: screen,
+                symbol: muted ? "speaker.slash.fill" : "speaker.wave.2.fill",
+                image: muted ? .speakerMuted : .speaker,
+                value: value, onScrub: onScrub)
+    }
+
+    // MARK: - HUD dragging
+    //
+    // The fraction is the position along the track, which for the built-in panel is not the
+    // brightness — the track spans 0...maxLevel. Each of these maps back, applies, and pushes
+    // the result into both the HUD and the menu row.
+
+    private func scrubBuiltIn(to fraction: Double) {
+        let value = min(max(Float(fraction) * maxLevel, 0), maxLevel)
+        setLevel(value)
+        if let display = builtInDisplay { sync(display, .brightness, Double(value)) }
+        osd.update(value: Double(value / maxLevel))
+    }
+
+    private func scrub(_ display: ManagedDisplay, to fraction: Double) {
+        let value = min(max(fraction, 0), 1)
+        applyBrightness(display, value, animated: false)
+        sync(display, .brightness, value)
+        osd.update(value: value)
+    }
+
+    private func scrubVolume(_ display: ManagedDisplay, to fraction: Double) {
+        guard let service = display.ddcService else { return }
+        display.volume = min(max(fraction, 0), 1)
+        DDC.writer.write(service, display: display.id, command: DDC.volume,
+                         value: UInt16((display.volume * Double(display.ddcVolumeMax)).rounded()))
+        // Raising the level unmutes, exactly as the volume-up key does — otherwise dragging
+        // the track up from zero moves the fill in silence.
+        if display.muted, display.volume > 0 {
+            display.muted = false
+            DDC.writer.write(service, display: display.id, command: DDC.mute, value: 2)
+        }
+        sync(display, .volume, display.volume)
+        osd.update(value: display.volume)
+    }
+
+    private func scrubVolume(_ device: AudioDeviceID, to fraction: Double) {
+        let value = min(max(fraction, 0), 1)
+        AudioOutput.setVolume(Float(value), on: device)
+        if value > 0, AudioOutput.isMuted(device) == true { AudioOutput.setMuted(false, on: device) }
+        osd.update(value: value)
     }
 
     /// Keep the open menu's slider and its percentage in step with a change made elsewhere.
@@ -435,7 +734,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let needsEDR = boosting
 
         if needsEDR {
+            // Reposition every time. If the display it was parked on changed size or went
+            // away, the window is now off-screen: not composited, so the EDR request lapses
+            // and the headroom collapses while the table is still scaled, which reads as
+            // blown-out whites.
+            if let screen = builtInScreen { positionTrigger(on: screen) }
             trigger.setEDREnabled(true)
+            // Re-asserted per show: a window ordered front while a fullscreen Space is active
+            // can be adopted by it (see OSD.show). For this window that would mean the EDR
+            // request only holds inside that Space — the boost silently lapsing everywhere
+            // else, with the gamma table still scaled.
+            window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
             window.orderFrontRegardless()
             waitForHDRThenApplyGamma()
         } else {
@@ -469,7 +778,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let deadline = Date().addingTimeInterval(5)
 
-        hdrWait = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] timer in
+        // Into .common, not the default mode: the status menu's tracking loop does not run
+        // default-mode timers, and every fresh crossing into the boost range rides this timer
+        // (EDR is always disengaged at that moment) — scheduled normally, a quick in-menu
+        // drag to 159% showed no boost for as long as the menu stayed open.
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] timer in
             guard let self = self else { timer.invalidate(); return }
             let engaged = self.builtInScreen?.hdrEngaged ?? false
             guard engaged || Date() > deadline else { return }
@@ -480,22 +793,104 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 GammaBoost.apply(factor: self.xdrFactor, to: id)
             }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        hdrWait = timer
     }
 
-    @objc private func reapply() { applyState() }
+    @objc private func reapply() {
+        guard isReady else { return }
+        refreshBuiltInBrightness()
+        applyState()
+    }
+
+    /// Pull the built-in's backlight back from the hardware into our model.
+    ///
+    /// Auto-brightness is on by default, and Control Center and the ambient sensor move the
+    /// backlight without telling us. Every one of those posts didChangeScreenParameters, which
+    /// is what lands here, so this is the moment the cache can go stale and the moment to fix
+    /// it. Deliberately *not* done inside the `level` getter: a read there would run before
+    /// our own queued write had reached the hardware, so it would report the pre-press value
+    /// and overwrite the fresh one with it.
+    private func refreshBuiltInBrightness() {
+        guard let builtIn = builtInDisplay, let live = AppleBrightness.get(builtIn.id) else { return }
+        builtIn.brightness = Double(live)
+    }
+
+    /// The display the pointer is on, matching how the media keys pick their target.
+    private var cursorScreen: NSScreen? {
+        let cursor = NSEvent.mouseLocation
+        return NSScreen.screens.first { NSMouseInRect(cursor, $0.frame, false) } ?? NSScreen.main
+    }
+
+    private func perform(_ action: ShortcutAction) {
+        switch action {
+        case .displayOff:
+            Shortcuts.sleepDisplays()
+
+        case .brightnessUp, .brightnessDown:
+            // Straight through the media-key path so a shortcut and the F1/F2 keys cannot
+            // drift apart in behaviour.
+            guard let screen = cursorScreen else { return }
+            _ = handleMediaKey(action == .brightnessUp ? .brightnessUp : .brightnessDown,
+                               on: screen, modifiers: [])
+
+        case .maximumBrightness:
+            guard let screen = cursorScreen, let id = screen.displayID,
+                  let target = display(for: id) else { return }
+            if target.isBuiltIn {
+                let shown = maxLevel
+                setLevel(shown)
+                sync(target, .brightness, Double(shown))
+                showBuiltInOSD(on: screen, level: shown)
+            } else {
+                applyBrightness(target, 1.0, animated: false)
+                sync(target, .brightness, target.brightness)
+                showOSD(on: screen, symbol: "sun.max.fill", image: .brightness,
+                        value: target.brightness,
+                        onScrub: { [weak self, weak target] fraction in
+                            guard let target = target else { return }
+                            self?.scrub(target, to: fraction)
+                        })
+            }
+        }
+    }
+
+    /// The settings window edited something. Re-read what is cached rather than working out
+    /// which control moved.
+    private func settingsChanged() {
+        excluded = Set(UserDefaults.standard.stringArray(forKey: "ExcludedBundleIDs") ?? [])
+        suspended = excluded.contains(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "")
+        if let screen = builtInScreen { positionTrigger(on: screen) }
+        shortcuts.reload()
+        applyState()
+        rebuildMenu()
+    }
+
+    @objc private func openSettings() { settings.show() }
 
     @objc private func frontmostAppChanged() {
         let frontmost = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
         let shouldSuspend = excluded.contains(frontmost)
-        guard shouldSuspend != suspended else { return }
+        guard shouldSuspend != suspended, isReady else { return }
         suspended = shouldSuspend
         applyState()
     }
 
     // MARK: - Menu
 
+    /// The rows are snapshots, and auto-brightness or Control Center move the backlight while
+    /// the menu is closed — the stale knob position is what a click would write. Refresh the
+    /// built-in from the hardware as the menu opens. (Re-reading the DDC registers here would
+    /// cost ~50ms of I2C per register with the menu already tracking, so externals keep their
+    /// cached values — their only outside mover is the monitor's own buttons.)
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshBuiltInBrightness()
+        if let builtIn = builtInDisplay { sync(builtIn, .brightness, Double(level)) }
+    }
+
     private func rebuildMenu() {
         let menu = NSMenu(title: "KelvinXDR")
+        menu.delegate = self
         rows.removeAll()
 
         for display in displays {
@@ -540,13 +935,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(check("Sync Contrast + Brightness", mergeContrast, #selector(toggleMergeContrast)))
         menu.addItem(check("Show Volume", showVolume, #selector(toggleShowVolume)))
         menu.addItem(check("Smooth Transitions", smooth, #selector(toggleSmooth)))
+        menu.addItem(check("Use System HUD", useSystemHUD, #selector(toggleSystemHUD)))
 
         if !mediaKeys.isRunning {
-            let item = NSMenuItem(title: "Enable Media Keys (needs Accessibility)…", action: #selector(enableMediaKeys), keyEquivalent: "")
+            let item = NSMenuItem(title: "Enable Media Keys…", action: #selector(enableMediaKeys), keyEquivalent: "")
             item.target = self
             item.image = NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: nil)
             menu.addItem(item)
         }
+        menu.addItem(.separator())
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
         menu.addItem(check("Launch at Login", SMAppService.mainApp.status == .enabled, #selector(toggleLaunchAtLogin)))
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
@@ -598,6 +998,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func toggleSync() { syncAll.toggle(); rebuildMenu() }
     @objc private func toggleSmooth() { smooth.toggle(); rebuildMenu() }
     @objc private func toggleShowVolume() { showVolume.toggle(); rebuildMenu() }
+    @objc private func toggleSystemHUD() { useSystemHUD.toggle(); rebuildMenu() }
 
     @objc private func toggleMergeContrast() {
         mergeContrast.toggle()
@@ -620,45 +1021,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
-    @objc private func builtInLevelChanged(_ sender: NSSlider) {
-        setLevel(Float(sender.doubleValue))
-        if let display = builtInDisplay {
-            rows[rowKey(display, .brightness)]?.label.stringValue = percent(sender.doubleValue)
+    /// The one path that writes a row's value, so a dragged slider and a typed percentage
+    /// cannot drift apart in what they actually do.
+    private func applyRow(_ display: ManagedDisplay, _ kind: Row, _ value: Double) {
+        switch kind {
+        case .brightness where display.isBuiltIn:
+            setLevel(Float(value))
+            sync(display, .brightness, value)
+
+        case .brightness:
+            let targets = syncAll ? displays.filter { $0.hasHardware || $0.softwareFraction > 0 } : [display]
+            for target in targets {
+                // The built-in lives on the 0...1.59 level model. Routing it through the raw
+                // external path moved the backlight under a still-scaled gamma table and left
+                // xdrFactor stale — dragging an external back to 100% then silently re-engaged
+                // a boost the built-in's own slider would have cleared. setLevel keeps model,
+                // gamma and trigger in step; handleMediaKey already special-cases this.
+                if target.isBuiltIn {
+                    setLevel(Float(value))
+                    sync(target, .brightness, value)
+                } else {
+                    applyBrightness(target, value, animated: false)
+                    sync(target, .brightness, value)
+                }
+            }
+
+        case .contrast:
+            // Contrast is only meaningful on displays with DDC, so the built-in and any
+            // shade-only display sit this out.
+            let targets = syncAll ? displays.filter { $0.ddcService != nil } : [display]
+            for target in targets {
+                guard let service = target.ddcService else { continue }
+                target.contrast = value
+                DDC.writer.write(service, display: target.id, command: DDC.contrast,
+                                 value: UInt16((value * Double(target.ddcContrastMax)).rounded()))
+                sync(target, .contrast, value)
+            }
+
+        case .volume:
+            guard let service = display.ddcService else { return }
+            display.volume = value
+            DDC.writer.write(service, display: display.id, command: DDC.volume,
+                             value: UInt16((value * Double(display.ddcVolumeMax)).rounded()))
+            sync(display, .volume, value)
         }
+    }
+
+    /// The levels the settings window offers for typing. Rebuilt on every open, because the
+    /// display list is not fixed.
+    private func editableValues() -> [SettingsWindowController.Value] {
+        var values: [SettingsWindowController.Value] = []
+        for display in displays {
+            func add(_ kind: Row, _ name: String, _ fraction: Double, max maxFraction: Double = 1) {
+                values.append(.init(title: "\(display.name) — \(name)",
+                                    fraction: fraction, maxFraction: maxFraction) { [weak self, weak display] value in
+                    guard let self = self, let display = display else { return }
+                    self.applyRow(display, kind, value)
+                })
+            }
+
+            if display.isBuiltIn {
+                add(.brightness, "Brightness", Double(level), max: Double(maxLevel))
+            } else if display.hasHardware || display.softwareFraction > 0 {
+                add(.brightness, "Brightness", display.brightness)
+            }
+            if display.ddcService != nil, !mergeContrast {
+                add(.contrast, "Contrast", display.contrast)
+            }
+            if display.hasAudio, showVolume || ownsAudio(display) {
+                add(.volume, "Volume", display.volume)
+            }
+        }
+        return values
+    }
+
+    @objc private func builtInLevelChanged(_ sender: NSSlider) {
+        guard let display = builtInDisplay else { return }
+        applyRow(display, .brightness, sender.doubleValue)
     }
 
     @objc private func brightnessChanged(_ sender: NSSlider) {
         guard let display = display(for: CGDirectDisplayID(sender.tag)) else { return }
-        let targets = syncAll ? displays.filter { $0.hasHardware || $0.softwareFraction > 0 } : [display]
-        for target in targets {
-            applyBrightness(target, sender.doubleValue, animated: false)
-            if target !== display { sync(target, .brightness, sender.doubleValue) }
-        }
-        rows[rowKey(display, .brightness)]?.label.stringValue = percent(sender.doubleValue)
+        applyRow(display, .brightness, sender.doubleValue)
     }
 
     @objc private func contrastChanged(_ sender: NSSlider) {
         guard let display = display(for: CGDirectDisplayID(sender.tag)) else { return }
-        // Same toggle as brightness: contrast is only meaningful on displays with DDC, so the
-        // built-in and any shade-only display sit this out.
-        let targets = syncAll ? displays.filter { $0.ddcService != nil } : [display]
-        for target in targets {
-            guard let service = target.ddcService else { continue }
-            target.contrast = sender.doubleValue
-            DDC.writer.write(service, display: target.id, command: DDC.contrast,
-                             value: UInt16((target.contrast * Double(target.ddcContrastMax)).rounded()))
-            if target !== display { sync(target, .contrast, target.contrast) }
-        }
-        rows[rowKey(display, .contrast)]?.label.stringValue = percent(display.contrast)
+        applyRow(display, .contrast, sender.doubleValue)
     }
 
     @objc private func volumeChanged(_ sender: NSSlider) {
-        guard let display = display(for: CGDirectDisplayID(sender.tag)),
-              let service = display.ddcService else { return }
-        display.volume = sender.doubleValue
-        DDC.writer.write(service, display: display.id, command: DDC.volume,
-                         value: UInt16((display.volume * Double(display.ddcVolumeMax)).rounded()))
-        rows[rowKey(display, .volume)]?.label.stringValue = percent(display.volume)
+        guard let display = display(for: CGDirectDisplayID(sender.tag)) else { return }
+        applyRow(display, .volume, sender.doubleValue)
     }
 
     @objc private func enableMediaKeys() {
@@ -672,7 +1126,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func pollForTrust() {
         guard !mediaKeys.isRunning else { return }
         trustPoll?.invalidate()
-        trustPoll = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] timer in
+        // .common for the same reason as hdrWait — a default-mode timer pauses while the
+        // status menu is open, which for this one only delays trust detection, but the fix
+        // is the same line.
+        let timer = Timer(timeInterval: 2.0, repeats: true) { [weak self] timer in
             guard let self = self else { timer.invalidate(); return }
             guard self.mediaKeys.isTrusted, self.mediaKeys.start() else { return }
             timer.invalidate()
@@ -680,6 +1137,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             UserDefaults.standard.set(true, forKey: "MediaKeysActive")
             self.rebuildMenu()
         }
+        RunLoop.main.add(timer, forMode: .common)
+        trustPoll = timer
     }
 
     @objc private func toggleLaunchAtLogin() {
@@ -690,7 +1149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try SMAppService.mainApp.register()
             }
         } catch {
-            NSLog("KelvinXDR: launch at login failed — \(error.localizedDescription)")
+            NSLog("KelvinXDR: launch at login failed. \(error.localizedDescription)")
         }
         rebuildMenu()
     }

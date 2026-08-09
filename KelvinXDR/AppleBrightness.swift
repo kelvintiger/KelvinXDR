@@ -31,8 +31,6 @@ enum AppleBrightness {
     /// Tells the system the level moved, so its own UI and any observers stay in sync.
     private static let changedFn: ChangedFn? = symbol("DisplayServicesBrightnessChanged", as: ChangedFn.self)
 
-    static var isAvailable: Bool { getFn != nil && setFn != nil }
-
     static func supported(_ display: CGDirectDisplayID) -> Bool {
         guard let canFn = canFn else { return false }
         return canFn(display) != 0
