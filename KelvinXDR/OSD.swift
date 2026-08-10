@@ -100,12 +100,21 @@ final class OSD {
         window.setFrameOrigin(NSPoint(x: frame.midX - size.width / 2,
                                       y: frame.maxY - size.height - max(menuBar, 24) - 6))
         cancelHide()
-        // Re-asserted on every show, not just at creation. Ordering the window front while a
-        // fullscreen Space is active can get it *adopted* by that Space, after which
-        // canJoinAllSpaces is effectively gone: every other Space changes the value with no
-        // HUD, and only the fullscreen app still shows it. Re-applying the behaviour makes
-        // WindowServer re-tag the window as float-everywhere. Same recipe as MonitorControl.
-        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        // Re-asserted only when the window is coming up from hidden — the edge matters.
+        //
+        // Two Space bugs shaped this. Ordering the window front from hidden while a
+        // fullscreen Space was active could get it *adopted* by that Space, after which
+        // every other Space changed the value with no HUD; re-asserting the behaviour at
+        // that moment fixes it. But re-asserting while the window was already visible on
+        // a fullscreen Space could *eject* it to the desktop Spaces mid-key-repeat, so it
+        // must not happen on every show.
+        //
+        // .stationary is a choice, not an accident: it keeps the HUD drawn during Mission
+        // Control (the requested behaviour — visible whatever the screen is doing).
+        // .transient was tried and hides it there, the way the system bezel hides.
+        if !window.isVisible {
+            window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        }
         window.orderFrontRegardless()
 
         scheduleHide()
@@ -170,6 +179,8 @@ final class OSD {
         window.hasShadow = false
         window.ignoresMouseEvents = true
         window.level = .screenSaver
+        // Matching show() — see the comment there for why .stationary and why the re-assert
+        // happens on the hidden -> visible edge.
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         window.animationBehavior = .none
 
