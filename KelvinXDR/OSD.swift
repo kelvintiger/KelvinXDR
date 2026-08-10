@@ -113,11 +113,34 @@ final class OSD {
         // Control (the requested behaviour — visible whatever the screen is doing).
         // .transient was tried and hides it there, the way the system bezel hides.
         if !window.isVisible {
-            window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+            reassertBehavior()
         }
         window.orderFrontRegardless()
+        // The stranded-window detector. A window that lived through a Space being torn down
+        // (a fullscreen app closing, a Mission Control drag) can come back attached to a
+        // Space that no longer exists: ordered in, alpha cycling exactly as designed, and
+        // visible nowhere — while isVisible reads true, so the hidden-edge re-assert above
+        // never fires. isOnActiveSpace reports that state directly; when it does, force a
+        // real re-tag and order front again.
+        if !window.isOnActiveSpace {
+            reassertBehavior()
+            window.orderFrontRegardless()
+        }
+
+        // A drag whose mouse-up never arrived would pin `dragging` true and stop every
+        // future hide, leaving the HUD immortal. If no button is physically down, it is
+        // not a drag, whatever the flag says.
+        if dragging, NSEvent.pressedMouseButtons == 0 { dragging = false }
 
         scheduleHide()
+    }
+
+    /// Setting collectionBehavior to its current value can be a no-op — AppKit is free to
+    /// skip the WindowServer re-tag when nothing changed, which quietly defeats a
+    /// "re-assert". Clearing it first makes the second assignment a real change.
+    private func reassertBehavior() {
+        window?.collectionBehavior = []
+        window?.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
     }
 
     /// Move the fill without touching the icon, position or hide timer — the drag callback
