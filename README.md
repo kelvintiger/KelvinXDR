@@ -1,5 +1,7 @@
 # KelvinXDR
 
+> I was trying to watch Silo on my MacBook Pro and it's so damn dark I made this app.
+
 Brightness control for macOS: XDR/HDR extra brightness on the built-in panel, plus
 hardware brightness, contrast and volume for external monitors over DDC/CI.
 
@@ -10,6 +12,35 @@ an extension of any one app anymore. It is a standalone tool that borrows ideas 
 from several excellent projects: MonitorControl for external display control, BrightIntosh
 and BrightXDR for the XDR boost technique, and BetterDisplay for the bar it sets on how
 small and non-intrusive a display utility should feel. Full credits below.
+
+## Get it running
+
+No Xcode needed, only Apple's free Command Line Tools. If you have never installed those,
+run this first and accept the prompt that appears (skip it if you already have them; it
+just tells you they are installed):
+
+```bash
+xcode-select --install
+```
+
+Then paste this, one block, start to finish:
+
+```bash
+git clone https://github.com/kelvintiger/KelvinXDR.git
+cd KelvinXDR
+./build.sh
+cp -R build/KelvinXDR.app /Applications/
+open /Applications/KelvinXDR.app
+```
+
+A circled sun appears in the menu bar. Two optional follow-ups:
+
+- **Media keys.** Click "Enable Media Keys" in the menu and grant Accessibility when macOS
+  asks. Without the grant, the brightness and volume keys keep their stock behaviour;
+  everything else still works.
+- **Rebuilding from source later?** Create the signing identity described under Signing
+  first. An ad-hoc build works fine, but macOS revokes the Accessibility grant every time
+  the binary changes, so the media keys stop until you re-grant.
 
 ## What it does
 
