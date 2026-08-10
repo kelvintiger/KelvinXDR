@@ -176,11 +176,14 @@ final class DisplayController {
             // the main queue, which froze gamma-dimmed displays mid-drag until menu close.
             GammaBoost.apply(factor: Float(software), to: display.id)
         case .shade:
-            // AppKit windows are main-thread-only, so the shade keeps the hop. It still lags
-            // while a menu is open — accepted for the AirPlay/Sidecar fallback tier.
-            DispatchQueue.main.async {
+            // AppKit windows are main-thread-only, so the shade needs the main thread — but
+            // through a common-modes run-loop block, not main.async: the menu's tracking
+            // loop starves the plain main queue, so a shade slider dragged in the menu did
+            // nothing on screen until the menu closed.
+            CFRunLoopPerformBlock(CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue) {
                 if let screen = screen { self.shade.apply(level: CGFloat(software), to: screen) }
             }
+            CFRunLoopWakeUp(CFRunLoopGetMain())
         }
     }
 

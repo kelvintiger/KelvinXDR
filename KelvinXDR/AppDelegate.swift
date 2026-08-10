@@ -164,7 +164,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 100% and the XDR half takes over. Shared by the getter and `setLevel`: if only one of
     /// them knew about the dead band, a value inside it would report as a different number
     /// than was set.
-    private let backlightMax: Double = 0.99
+    ///
+    /// 0.995, deliberately narrower than any typeable percent: at 0.99 a typed "99" fell
+    /// inside the band and silently became 100%. Every whole percent and every 1/64 detent
+    /// now round-trips exactly; the band still absorbs sub-half-percent hardware jitter
+    /// (DisplayServices reads back exact values on this panel — set 1.0, read 1.0).
+    private let backlightMax: Double = 0.995
 
     /// The built-in panel's one control, 0...maxLevel. 1.0 is 100%: backlight at maximum, no
     /// boost. Below that it is the backlight; above it the backlight stays pinned and gamma
@@ -878,14 +883,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Menu
 
-    /// The rows are snapshots, and auto-brightness or Control Center move the backlight while
-    /// the menu is closed — the stale knob position is what a click would write. Refresh the
-    /// built-in from the hardware as the menu opens. (Re-reading the DDC registers here would
-    /// cost ~50ms of I2C per register with the menu already tracking, so externals keep their
-    /// cached values — their only outside mover is the monitor's own buttons.)
+    /// The rows are snapshots, and outside movers change the hardware while the menu is
+    /// closed: auto-brightness and Control Center move the backlight, the monitor's own
+    /// buttons move the DDC registers. The stale knob position is what a click would write,
+    /// so refresh both as the menu opens — the built-in synchronously (the read is local),
+    /// the DDC registers asynchronously off the I2C bus.
     func menuWillOpen(_ menu: NSMenu) {
         refreshBuiltInBrightness()
         if let builtIn = builtInDisplay { sync(builtIn, .brightness, Double(level)) }
+        refreshDDCRows()
+    }
+
+    /// Land each DDC display's real register values into the already-open menu.
+    ///
+    /// The reads run off-thread (~70ms per register on the bus), and the results come back
+    /// through a common-modes run-loop block, not `main.async` — the menu's tracking loop
+    /// starves the plain main queue, so a queued block would only run after the menu closed.
+    /// A result is dropped if the user touched that display while the read was on the bus:
+    /// their value is newer than the hardware snapshot.
+    private func refreshDDCRows() {
+        for display in displays {
+            guard display.ddcService != nil else { continue }
+            let snapshot = (display.brightness, display.contrast, display.volume)
+            DispatchQueue.global(qos: .userInitiated).async { [weak self, weak display] in
+                guard let display = display, let service = display.ddcService else { return }
+                let b = DDC.read(service, DDC.brightness)
+                let c = DDC.read(service, DDC.contrast)
+                let v = DDC.read(service, DDC.volume)
+                let m = DDC.read(service, DDC.mute)
+                CFRunLoopPerformBlock(CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue) {
+                    guard let self = self,
+                          (display.brightness, display.contrast, display.volume) == snapshot
+                    else { return }
+                    if let b = b {
+                        // Inverse of split(): the register only holds the hardware segment of
+                        // the combined 0...1 scale. At register zero the software share is
+                        // unknowable from the monitor, so the cache stands.
+                        let hw = Double(b.current) / Double(display.ddcBrightnessMax)
+                        if hw > 0 {
+                            let f = display.softwareFraction
+                            display.brightness = f + hw * (1 - f)
+                            self.sync(display, .brightness, display.brightness)
+                        }
+                    }
+                    if let c = c {
+                        display.contrast = Double(c.current) / Double(display.ddcContrastMax)
+                        self.sync(display, .contrast, display.contrast)
+                    }
+                    if let v = v {
+                        display.volume = Double(v.current) / Double(display.ddcVolumeMax)
+                        self.sync(display, .volume, display.volume)
+                    }
+                    if let m = m { display.muted = m.current == 1 }
+                }
+                CFRunLoopWakeUp(CFRunLoopGetMain())
+            }
+        }
     }
 
     private func rebuildMenu() {
