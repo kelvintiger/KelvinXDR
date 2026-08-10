@@ -586,6 +586,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard AudioOutput.setVolume(next, on: device) else { return false }
             // Nudging off zero unmutes, which is what the hardware keys do.
             if next > 0, AudioOutput.isMuted(device) == true { AudioOutput.setMuted(false, on: device) }
+            // And zero mutes. Scalar 0 is not silence everywhere: DisplayPort and HDMI audio
+            // devices keep emitting at their minimum level with the scalar on the floor —
+            // observed as "every indicator says muted, the video is still audible". Control
+            // Center's slider silences its far end by setting the mute flag; match it.
+            if next == 0, AudioOutput.isMuted(device) == false { AudioOutput.setMuted(true, on: device) }
             click(adjustment)
             showVolumeOSD(on: screen, value: Double(next), muted: next == 0,
                           onScrub: { [weak self] fraction in self?.scrubVolume(device, to: fraction) })
@@ -715,6 +720,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let value = min(max(fraction, 0), 1)
         AudioOutput.setVolume(Float(value), on: device)
         if value > 0, AudioOutput.isMuted(device) == true { AudioOutput.setMuted(false, on: device) }
+        // Zero mutes, matching the key path — scalar 0 alone is audible on DP/HDMI audio.
+        if value == 0, AudioOutput.isMuted(device) == false { AudioOutput.setMuted(true, on: device) }
         osd.update(value: value)
     }
 

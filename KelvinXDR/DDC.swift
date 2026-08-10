@@ -105,7 +105,7 @@ enum DDC {
     static func read(_ service: IOAVService, _ command: UInt8) -> (current: UInt16, max: UInt16)? {
         var send: [UInt8] = [command]
         var reply = [UInt8](repeating: 0, count: 11)
-        guard communicate(service, send: &send, reply: &reply) else { return nil }
+        guard communicate(service, send: &send, reply: &reply, expecting: command) else { return nil }
         return parseReply(reply, command: command)
     }
 
@@ -202,8 +202,15 @@ enum DDC {
         return lock
     }
 
+    /// - expecting: for reads, the VCP opcode the reply must echo. The monitor holds ONE
+    ///   reply buffer and overwrites it when it gets around to a request, so a checksum-valid
+    ///   reply echoing a previous opcode means "not ready yet", not "failed" — the right move
+    ///   is to read again *without* re-sending. Re-sending is the classic mistake: it queues
+    ///   another answer and the conversation stays one reply behind for the rest of the
+    ///   session, which is exactly how a panel "loses" its volume row until the next hotplug.
+    ///   Measured on both LGs: the first request after bus idle can take >50ms to answer.
     private static func communicate(_ service: IOAVService, send: inout [UInt8], reply: inout [UInt8],
-                                    retries: Int = 4) -> Bool {
+                                    retries: Int = 4, expecting: UInt8? = nil) -> Bool {
         var packet: [UInt8] = [UInt8(0x80 | (send.count + 1)), UInt8(send.count)] + send + [0]
         packet[packet.count - 1] = checksum(
             send.count == 1 ? sevenBitAddress << 1 : sevenBitAddress << 1 ^ dataAddress,
@@ -221,9 +228,16 @@ enum DDC {
                                               &packet, UInt32(packet.count)) == 0
             }
             if !reply.isEmpty {
-                usleep(50000)
-                if IOAVServiceReadI2C(service, UInt32(sevenBitAddress), 0, &reply, UInt32(reply.count)) == 0 {
-                    success = checksum(0x50, &reply, 0, reply.count - 2) == reply[reply.count - 1]
+                success = false
+                for _ in 0..<4 {
+                    usleep(50000)
+                    guard IOAVServiceReadI2C(service, UInt32(sevenBitAddress), 0, &reply, UInt32(reply.count)) == 0,
+                          checksum(0x50, &reply, 0, reply.count - 2) == reply[reply.count - 1]
+                    else { continue }
+                    // A stale echo: our request has not been processed yet. Keep reading.
+                    if let expecting = expecting, reply.count > 4, reply[4] != expecting { continue }
+                    success = true
+                    break
                 }
             }
             if success { return true }
