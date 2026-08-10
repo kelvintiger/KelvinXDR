@@ -114,3 +114,12 @@ A menu bar app is awkward to inspect from a shell. These all work without a huma
   drop out of XDR and pop back; compare the display set first.
 - The gamma boost only has headroom to move into once the display is in EDR mode, which
   lags the trigger window appearing by up to ~100ms.
+- Spaces bit twice. Ordering a floating window front *from hidden* while a fullscreen Space
+  is active can get it adopted by that Space (it then shows only there); re-asserting
+  `collectionBehavior` at that hidden-to-visible edge is the fix, and `OSD.show` does it.
+  Re-asserting while the window is already *visible* causes the opposite bug — ejection to
+  the desktop Spaces mid-key-repeat — so never re-assert on every show. The HUD's
+  `.stationary` is a recorded user choice (visible during Mission Control); `.transient`
+  hides it there like the system bezel. The EDR trigger must never become `.transient`:
+  hidden during Mission Control means the EDR request lapses while the gamma table is
+  still scaled.
