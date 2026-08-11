@@ -335,6 +335,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
         applyState()
         refreshDisplays()
+
+        // One breadcrumb per launch, so field debugging can first prove the app's logs
+        // reach the unified log at all — during the HUD-zombie hunt an empty `log show`
+        // could not distinguish "nothing happened" from "logs not captured".
+        NSLog("KelvinXDR: launched, %d display(s)", NSScreen.screens.count)
     }
 
     func applicationWillTerminate(_ aNotification: Notification) {

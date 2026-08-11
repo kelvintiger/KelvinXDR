@@ -355,6 +355,10 @@ expect(Detent.notch(1.2) > 16 && Detent.notch(1.2) < 19, "120% sits inside the X
 // checked by eye from a shell. Its geometry can be, which covers the two things most likely to
 // be silently wrong: where it sits, and whether it is eating clicks meant for the app beneath.
 section("OSD — the compact HUD")
+// A CI runner's window server may omit the on-screen key even for windows it is drawing,
+// and a spurious zombie-rebuild mid-test would swap the window out from under the
+// assertions below. The verify path needs a real zombie to test, which no harness can make.
+OSD.verificationEnabled = false
 if let screen = NSScreen.main {
     func findTrack(_ view: NSView) -> OSDTrack? {
         if let track = view as? OSDTrack { return track }

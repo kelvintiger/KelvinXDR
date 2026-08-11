@@ -156,16 +156,26 @@ final class OSD {
     /// the server says it is not drawing it, the window is a zombie — rebuild it from
     /// scratch and replay, because a fresh window has no history for the Space system to
     /// hold against it.
+    /// Off in the hardware-free tests only: a CI runner's window server may omit the
+    /// on-screen key even for healthy windows, and a spurious rebuild mid-test would fail
+    /// assertions against the replaced window. Everywhere else this stays on.
+    static var verificationEnabled = true
+
     private func scheduleVerify() {
+        guard OSD.verificationEnabled else { return }
         verifyTimer?.invalidate()
         let timer = Timer(timeInterval: 0.15, repeats: false) { [weak self] _ in
             guard let self = self, let window = self.window, window.isVisible else { return }
             let info = CGWindowListCopyWindowInfo(.optionIncludingWindow,
                                                   CGWindowID(window.windowNumber)) as? [[String: Any]]
-            // Only an explicit "not on screen" convicts; a missing entry or key is an
-            // environment quirk, not evidence.
-            guard let entry = info?.first,
-                  (entry[kCGWindowIsOnscreen as String] as? Bool) == false else { return }
+            guard let entry = info?.first else { return }
+            // kCGWindowIsOnscreen is an *optional* key: the server OMITS it for windows it
+            // is not compositing rather than writing false. Requiring an explicit false is
+            // the bug that let a zombie run a whole day undetected — show() positioned and
+            // faded it perfectly on every keypress, the entry existed, the key was simply
+            // absent, and the old guard read that silence as "fine". Absence is the no.
+            let onscreen = (entry[kCGWindowIsOnscreen as String] as? Bool) ?? false
+            guard !onscreen else { return }
             self.rebuildZombieWindow()
         }
         RunLoop.main.add(timer, forMode: .common)
@@ -176,6 +186,13 @@ final class OSD {
         guard rebuildAllowed else { return }
         rebuildAllowed = false
         NSLog("KelvinXDR: HUD window not composited by the window server — rebuilding it.")
+        // Defaults, not just the log: NSLog from this app is not readable via `log show`
+        // without admin, which made a whole day of field evidence unreadable. The defaults
+        // domain is the channel that provably works headlessly (MediaKeysActive set the
+        // precedent) — `defaults read com.kelvin.KelvinXDR HUDRebuilds` is the tally.
+        let defaults = UserDefaults.standard
+        defaults.set(defaults.integer(forKey: "HUDRebuilds") + 1, forKey: "HUDRebuilds")
+        defaults.set(Date().timeIntervalSince1970, forKey: "HUDLastRebuild")
 
         hideWorkItem?.cancel()
         hideWorkItem = nil
