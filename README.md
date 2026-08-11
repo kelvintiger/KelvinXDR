@@ -7,6 +7,8 @@ hardware brightness, contrast and volume for external monitors over DDC/CI.
 
 Built for a MacBook Pro 16" (M1 Pro, Liquid Retina XDR) driving two external displays.
 
+Website: <https://kelvinct.com/KelvinXDR/>
+
 KelvinXDR started as an experiment on top of BrightXDR and outgrew it. It is not a fork or
 an extension of any one app anymore. It is a standalone tool that borrows ideas and code
 from several excellent projects: MonitorControl for external display control, BrightIntosh
@@ -213,7 +215,10 @@ DEALINGS IN THE SOFTWARE.
 
 ## License
 
-GPL-3.0. See [LICENSE.md](LICENSE.md).
+GPL-3.0. See [LICENSE.md](LICENSE.md). The GPL is the licence; [TERMS.md](TERMS.md) only
+summarises it and warns about the private-API and gamma caveats, and adds no conditions.
+
+[PRIVACY.md](PRIVACY.md): the app collects nothing and talks to no server.
 
 If you want a maintained app instead of a personal one, use
 [BrightIntosh](https://github.com/niklasr22/BrightIntosh) for XDR brightness or
