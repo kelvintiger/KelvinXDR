@@ -72,6 +72,22 @@ final class OSD {
     ///   also what stops it swallowing clicks for indicators that have nothing to drag.
     func show(on screen: NSScreen, symbol: String, value: Double?, mark: Double? = nil,
               onScrub: ((Double) -> Void)? = nil) {
+        show(on: screen, symbol: symbol, value: value, mark: mark, onScrub: onScrub, isReplay: false)
+    }
+
+    /// What the last show displayed, so a rebuilt window can replay it.
+    private var lastShow: (screenID: CGDirectDisplayID?, symbol: String, value: Double?,
+                           mark: Double?, onScrub: ((Double) -> Void)?)?
+    /// One rebuild per user-visible show: if a freshly built window is also refused by the
+    /// window server, something systemic is wrong and looping would not fix it.
+    private var rebuildAllowed = false
+
+    private func show(on screen: NSScreen, symbol: String, value: Double?, mark: Double?,
+                      onScrub: ((Double) -> Void)?, isReplay: Bool) {
+        if !isReplay {
+            lastShow = (screen.displayID, symbol, value, mark, onScrub)
+            rebuildAllowed = true
+        }
         let window = self.window ?? makeWindow()
 
         icon?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
@@ -116,16 +132,6 @@ final class OSD {
             reassertBehavior()
         }
         window.orderFrontRegardless()
-        // The stranded-window detector. A window that lived through a Space being torn down
-        // (a fullscreen app closing, a Mission Control drag) can come back attached to a
-        // Space that no longer exists: ordered in, alpha cycling exactly as designed, and
-        // visible nowhere — while isVisible reads true, so the hidden-edge re-assert above
-        // never fires. isOnActiveSpace reports that state directly; when it does, force a
-        // real re-tag and order front again.
-        if !window.isOnActiveSpace {
-            reassertBehavior()
-            window.orderFrontRegardless()
-        }
 
         // A drag whose mouse-up never arrived would pin `dragging` true and stop every
         // future hide, leaving the HUD immortal. If no button is physically down, it is
@@ -133,6 +139,62 @@ final class OSD {
         if dragging, NSEvent.pressedMouseButtons == 0 { dragging = false }
 
         scheduleHide()
+        scheduleVerify()
+    }
+
+    private var verifyTimer: Timer?
+
+    /// The stranded-window detector, asking the window server rather than the window.
+    ///
+    /// A window that lived through a Space being torn down (undocking a display, a
+    /// fullscreen app closing) can come back attached to a Space that no longer exists:
+    /// ordered in, alpha cycling exactly as designed, drawn nowhere. Every in-process
+    /// check passes in that state — `isVisible` is our own bookkeeping, and with
+    /// canJoinAllSpaces set, `isOnActiveSpace` can simply answer yes; a heal gated on it
+    /// shipped and failed in the field. `kCGWindowIsOnscreen` is the server's actual
+    /// compositing verdict. A beat after ordering front, if we believe the HUD is up and
+    /// the server says it is not drawing it, the window is a zombie — rebuild it from
+    /// scratch and replay, because a fresh window has no history for the Space system to
+    /// hold against it.
+    private func scheduleVerify() {
+        verifyTimer?.invalidate()
+        let timer = Timer(timeInterval: 0.15, repeats: false) { [weak self] _ in
+            guard let self = self, let window = self.window, window.isVisible else { return }
+            let info = CGWindowListCopyWindowInfo(.optionIncludingWindow,
+                                                  CGWindowID(window.windowNumber)) as? [[String: Any]]
+            // Only an explicit "not on screen" convicts; a missing entry or key is an
+            // environment quirk, not evidence.
+            guard let entry = info?.first,
+                  (entry[kCGWindowIsOnscreen as String] as? Bool) == false else { return }
+            self.rebuildZombieWindow()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        verifyTimer = timer
+    }
+
+    private func rebuildZombieWindow() {
+        guard rebuildAllowed else { return }
+        rebuildAllowed = false
+        NSLog("KelvinXDR: HUD window not composited by the window server — rebuilding it.")
+
+        hideWorkItem?.cancel()
+        hideWorkItem = nil
+        hideGeneration += 1
+        dragging = false
+        window?.orderOut(nil)
+        window = nil
+        icon = nil
+        fill = nil
+        notch = nil
+        track = nil
+
+        // Replay onto the same display if it still exists; if it vanished with an undock,
+        // the next keypress shows fresh anyway.
+        guard let last = lastShow,
+              let screen = NSScreen.screens.first(where: { $0.displayID == last.screenID })
+        else { return }
+        show(on: screen, symbol: last.symbol, value: last.value, mark: last.mark,
+             onScrub: last.onScrub, isReplay: true)
     }
 
     /// Setting collectionBehavior to its current value can be a no-op — AppKit is free to

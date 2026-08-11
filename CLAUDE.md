@@ -123,3 +123,9 @@ A menu bar app is awkward to inspect from a shell. These all work without a huma
   hides it there like the system bezel. The EDR trigger must never become `.transient`:
   hidden during Mission Control means the EDR request lapses while the gamma table is
   still scaled.
+- A window can survive its Space being torn down (undock, fullscreen app closing) as a
+  zombie: ordered in, alpha animating, drawn nowhere. No in-process check detects this —
+  `isVisible` is our own bookkeeping, and `isOnActiveSpace` answers yes for any
+  canJoinAllSpaces window (a heal gated on it shipped and failed in the field). The only
+  honest detector is the window server's `kCGWindowIsOnscreen` for the window number, and
+  the only reliable cure is rebuilding the window. `OSD.scheduleVerify` does both.
