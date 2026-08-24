@@ -155,9 +155,11 @@ A menu bar app is awkward to inspect from a shell. These all work without a huma
   per-window mapping. Ask for one window at a time or the answer is meaningless.
 - The transferred prototype recorded `SLSBridgedMoveWindowsToManagedSpaceOperation` working
   on Sequoia 15.7.9 (24G830), SIP enabled, on 2026-08-20: a disposable window moved away and
-  back, confirmed each way with `SLSCopySpacesForWindows`. Revalidate the corrected adapter on
-  this machine before making the final support claim. SpaceKit externally validates Tahoe
-  26.4+, but this project has no Tahoe hardware. Never say "verified on Tahoe." The obsolete
+  back, confirmed each way with `SLSCopySpacesForWindows`. The corrected adapter's later
+  cross-managed-display diagnostic was accepted but did not verify on its target before the
+  bound; the disposable window remained on its source Space. Do not claim verified Sequoia
+  writes from either result. SpaceKit externally validates Tahoe 26.4+, but this project has
+  no Tahoe or macOS 27 hardware. Never say "verified on Tahoe" or macOS 27. The obsolete
   `SLSSpaceSetCompatID` + `SLSSetWindowListWorkspace` path is dead on Sequoia and must not
   return.
 - The bridged move needs no Objective-C file. `@objc private protocol` declaring
@@ -200,6 +202,11 @@ A menu bar app is awkward to inspect from a shell. These all work without a huma
   string on this Mac (separate Spaces on), which is what lets a saved display be mapped back to
   a `CGDisplayBounds` for the AX move. Do not assume identity in policy or persistence; store
   the measured mapping. In shared literal-`Main` mode, per-display restoration is unavailable.
+- Space protection has no menu-bar item. Its only UI is the Settings section titled
+  `Space Layout Protection — Experimental`. `ExperimentalSpaceWritesEnabled` is a separate
+  default-off release gate enforced by the manager, not merely disabled UI. Save/profile file
+  operations remain available; Restore, conversion, desktop creation, and automatic writes do
+  not. Disabling the gate also clears `AutomaticallyRestoreSpaceLayouts` and pending work.
 - Automatic restoration is separate from manual save/restore/conversion and defaults off. A
   topology notification only re-arms debounce; re-sample physical displays after it fires.
   Disabling the toggle invalidates the token and cancels the pending work immediately. Never

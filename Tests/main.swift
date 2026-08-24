@@ -178,6 +178,12 @@ _ = NSApplication.shared
 NSApplication.shared.setActivationPolicy(.accessory)
 
 let settings = SettingsWindowController()
+var testExperimentalWrites = false
+settings.experimentalWritesEnabled = { testExperimentalWrites }
+settings.automaticSpaceRestoreEnabled = { false }
+settings.canCaptureSpaceLayout = { true }
+settings.canRestoreSpaceLayout = { testExperimentalWrites }
+settings.canConvertFullscreenApps = { testExperimentalWrites }
 // Populate the levels grid before measuring, including a display name far longer than
 // anything real — an unconstrained label there would widen the window exactly the way the
 // wrapping paragraphs once did.
@@ -242,6 +248,32 @@ if let content = settings.contentStack {
     }
     expect(settings.window?.styleMask.contains(.resizable) == true,
            "and the window can be dragged taller")
+
+    func descendants(_ view: NSView) -> [NSView] {
+        view.subviews + view.subviews.flatMap(descendants)
+    }
+    let settingsViews = descendants(content)
+    let labels = settingsViews.compactMap { $0 as? NSTextField }.map(\.stringValue)
+    let buttons = settingsViews.compactMap { $0 as? NSButton }
+    func button(_ title: String) -> NSButton? { buttons.first { $0.title == title } }
+    expect(labels.contains("Space Layout Protection — Experimental"),
+           "Space protection is visibly marked Experimental in Settings")
+    expect(button("Enable Experimental Space Writes")?.state == .off,
+           "the Settings write opt-in renders off by default")
+    expect(button("Automatically Restore Layouts")?.isEnabled == false,
+           "automatic restoration stays disabled until experimental writes are enabled")
+    expect(button("Save Current As…")?.isEnabled == true,
+           "non-Space-writing layout capture remains available while writes are off")
+    expect(button("Restore Now")?.isEnabled == false,
+           "Restore is disabled while experimental writes are off")
+    expect(button("Convert Fullscreen Apps to Dedicated Desktops…")?.isEnabled == false,
+           "fullscreen conversion is disabled while experimental writes are off")
+    testExperimentalWrites = true
+    settings.reload()
+    expect(button("Automatically Restore Layouts")?.isEnabled == true
+           && button("Restore Now")?.isEnabled == true
+           && button("Convert Fullscreen Apps to Dedicated Desktops…")?.isEnabled == true,
+           "write controls become available only after the explicit Settings opt-in")
 
     // The popup's titles and the stored corner values are parallel lists. Reordering the
     // titles without the values would silently park the EDR trigger in the wrong corner, and
@@ -513,6 +545,21 @@ coordinator.noteTopologyChange()
 expect(!coordinator.finish(automaticRestoreEnabled: false),
        "disabling automatic restoration cancels the deferred topology evaluation")
 
+section("Experimental Space-write release gate")
+var experimentalGate = ExperimentalSpaceWriteGate()
+expect(!experimentalGate.writesEnabled && !experimentalGate.automaticRestoreEnabled,
+       "experimental Space writes and automatic restoration default off")
+experimentalGate.setAutomaticRestoreEnabled(true)
+expect(!experimentalGate.automaticRestoreEnabled,
+       "automatic restoration cannot bypass the experimental write opt-in")
+experimentalGate.setWritesEnabled(true)
+experimentalGate.setAutomaticRestoreEnabled(true)
+expect(experimentalGate.writesEnabled && experimentalGate.automaticRestoreEnabled,
+       "automatic restoration requires both explicit opt-ins")
+experimentalGate.setWritesEnabled(false)
+expect(!experimentalGate.writesEnabled && !experimentalGate.automaticRestoreEnabled,
+       "turning experimental writes off immediately turns automatic restoration off")
+
 // MARK: fixtures
 
 func win(_ id: UInt32, _ app: String, title: String? = nil, document: String? = nil,
@@ -716,23 +763,34 @@ expect(SpacePlanner.match([win(10, "Terminal", title: "bash", 100, 100)],
 
 section("Exact-profile gating and normal restore planning")
 expect(SpacePlanner.restoreEligibility(snapshotTopology: topology("A"), currentTopology: topology("B"),
-                                       mode: .separate, automaticEnabled: true,
+                                       mode: .separate, experimentalWritesEnabled: true,
+                                       automaticEnabled: true,
                                        capabilities: allCapabilities, circuitOpen: false)
        == .blocked(.topologyMismatch), "a profile never crosses physical topologies")
 expect(SpacePlanner.restoreEligibility(snapshotTopology: topology("A"), currentTopology: topology("A"),
-                                       mode: .sharedMain, automaticEnabled: true,
+                                       mode: .sharedMain, experimentalWritesEnabled: true,
+                                       automaticEnabled: true,
                                        capabilities: allCapabilities, circuitOpen: false)
        == .blocked(.sharedSpaceDomain), "shared Main mode disables per-display restoration")
 expect(SpacePlanner.restoreEligibility(snapshotTopology: topology("A"), currentTopology: topology("A"),
-                                       mode: .separate, automaticEnabled: false,
+                                       mode: .separate, experimentalWritesEnabled: false,
+                                       automaticEnabled: true,
+                                       capabilities: allCapabilities, circuitOpen: false)
+       == .blocked(.experimentalWritesDisabled),
+       "restore planning requires the explicit experimental write opt-in")
+expect(SpacePlanner.restoreEligibility(snapshotTopology: topology("A"), currentTopology: topology("A"),
+                                       mode: .separate, experimentalWritesEnabled: true,
+                                       automaticEnabled: false,
                                        capabilities: allCapabilities, circuitOpen: false)
        == .blocked(.automaticRestoreDisabled), "a scheduled restore rechecks the opt-in toggle")
 expect(SpacePlanner.restoreEligibility(snapshotTopology: topology("A"), currentTopology: topology("A"),
-                                       mode: .separate, automaticEnabled: true,
+                                       mode: .separate, experimentalWritesEnabled: true,
+                                       automaticEnabled: true,
                                        capabilities: missingMovement, circuitOpen: false)
        == .blocked(.missingCapabilities), "a scheduled restore rechecks runtime capabilities")
 expect(SpacePlanner.restoreEligibility(snapshotTopology: topology("A"), currentTopology: topology("A"),
-                                       mode: .separate, automaticEnabled: true,
+                                       mode: .separate, experimentalWritesEnabled: true,
+                                       automaticEnabled: true,
                                        capabilities: allCapabilities, circuitOpen: true)
        == .blocked(.writeCircuitOpen), "the session circuit is checked before automatic writes")
 

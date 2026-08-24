@@ -103,6 +103,27 @@ struct TopologyDebouncer {
     }
 }
 
+/// Pure release gate for the unverified Space-write path. Automatic restoration is a second
+/// opt-in nested under this gate: disabling experimental writes always disables it too.
+struct ExperimentalSpaceWriteGate: Equatable {
+    private(set) var writesEnabled: Bool
+    private(set) var automaticRestoreEnabled: Bool
+
+    init(writesEnabled: Bool = false, automaticRestoreEnabled: Bool = false) {
+        self.writesEnabled = writesEnabled
+        self.automaticRestoreEnabled = writesEnabled && automaticRestoreEnabled
+    }
+
+    mutating func setWritesEnabled(_ enabled: Bool) {
+        writesEnabled = enabled
+        if !enabled { automaticRestoreEnabled = false }
+    }
+
+    mutating func setAutomaticRestoreEnabled(_ enabled: Bool) {
+        automaticRestoreEnabled = writesEnabled && enabled
+    }
+}
+
 /// Pure overlap policy for save/restore/conversion. A topology change arriving during an
 /// operation is remembered and re-evaluated exactly once when the operation finishes.
 struct LayoutOperationCoordinator {

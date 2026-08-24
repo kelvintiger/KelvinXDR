@@ -93,6 +93,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         controller.layoutMutationsEnabled = { [weak self] in
             !(self?.spaces.isOperating ?? true)
         }
+        controller.experimentalWritesEnabled = { [weak self] in
+            self?.spaces.experimentalWritesEnabled ?? false
+        }
+        controller.setExperimentalWritesEnabled = { [weak self] enabled in
+            self?.spaces.experimentalWritesEnabled = enabled
+        }
+        controller.automaticSpaceRestoreEnabled = { [weak self] in
+            self?.spaces.automaticRestoreEnabled ?? false
+        }
+        controller.setAutomaticSpaceRestoreEnabled = { [weak self] enabled in
+            self?.spaces.automaticRestoreEnabled = enabled
+        }
+        controller.spaceCapabilityStatus = { [weak self] in
+            self?.spaces.capabilityStatusText
+        }
+        controller.canCaptureSpaceLayout = { [weak self] in self?.spaces.canSave ?? false }
+        controller.canRestoreSpaceLayout = { [weak self] in self?.spaces.canRestore ?? false }
+        controller.canConvertFullscreenApps = { [weak self] in self?.spaces.canConvert ?? false }
+        controller.convertFullscreenApps = { [weak self] in self?.spaces.convertFullscreenApps() }
         settingsController = controller
         return controller
     }
@@ -334,11 +353,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 
-        // The initial read-only capability inventory can complete immediately and its
-        // onChange callback rebuilds the menu, so register now and start after all menu
-        // dependencies below are initialized.
+        // The initial read-only capability inventory can complete immediately. Space controls
+        // live only in Settings, so its callback refreshes that window without adding menu UI.
         spaces.onChange = { [weak self] in
-            self?.rebuildMenu()
             if self?.settingsController?.window?.isVisible == true {
                 self?.settingsController?.reload()
             }
@@ -1042,7 +1059,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(check("Show Volume", showVolume, #selector(toggleShowVolume)))
         menu.addItem(check("Smooth Transitions", smooth, #selector(toggleSmooth)))
         menu.addItem(check("Use System HUD", useSystemHUD, #selector(toggleSystemHUD)))
-        menu.addItem(spacesMenu())
 
         if !mediaKeys.isRunning {
             let item = NSMenuItem(title: "Enable Media Keys…", action: #selector(enableMediaKeys), keyEquivalent: "")
@@ -1057,48 +1073,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(check("Launch at Login", SMAppService.mainApp.status == .enabled, #selector(toggleLaunchAtLogin)))
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
-    }
-
-    /// Its own submenu: these actions have nothing to do with brightness, and the main
-    /// menu is already one row per display per control.
-    private func spacesMenu() -> NSMenuItem {
-        let item = NSMenuItem(title: "Space Layout Protection", action: nil, keyEquivalent: "")
-        let submenu = NSMenu(title: "Space Layout Protection")
-        // Restore is greyed out until something has been saved, and AppKit only leaves an
-        // explicit isEnabled alone once it has been told to stop enabling items itself.
-        submenu.autoenablesItems = false
-
-        if let status = spaces.capabilityStatusText {
-            let note = NSMenuItem(title: status, action: nil, keyEquivalent: "")
-            note.isEnabled = false
-            submenu.addItem(note)
-        }
-        let automatic = check("Automatically Restore Layouts", spaces.automaticRestoreEnabled,
-                              #selector(toggleAutomaticSpaceRestore))
-        // Always allow turning it off immediately, including while an operation is active.
-        automatic.isEnabled = spaces.automaticRestoreEnabled || spaces.capabilities.canRestore
-        submenu.addItem(automatic)
-        submenu.addItem(.separator())
-
-        let save = NSMenuItem(title: "Save Current Normal-Space Layout",
-                              action: #selector(saveSpaceLayout), keyEquivalent: "")
-        save.target = self
-        save.isEnabled = spaces.canSave
-        submenu.addItem(save)
-
-        let restore = NSMenuItem(title: "Restore Normal-Space Layout",
-                                 action: #selector(restoreSpaceLayout), keyEquivalent: "")
-        restore.target = self
-        restore.isEnabled = spaces.hasSavedLayout && spaces.canRestore
-        submenu.addItem(restore)
-
-        let conversion = NSMenuItem(title: "Convert Fullscreen Apps to Dedicated Desktops…",
-                                    action: #selector(convertFullscreenApps), keyEquivalent: "")
-        conversion.target = self
-        conversion.isEnabled = spaces.canConvert
-        submenu.addItem(conversion)
-        item.submenu = submenu
-        return item
     }
 
     private func check(_ title: String, _ on: Bool, _ action: Selector) -> NSMenuItem {
@@ -1143,14 +1117,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: - Actions
-
-    @objc private func toggleAutomaticSpaceRestore() {
-        spaces.automaticRestoreEnabled.toggle()
-        rebuildMenu()
-    }
-    @objc private func saveSpaceLayout() { spaces.saveCurrentLayout() }
-    @objc private func restoreSpaceLayout() { spaces.restoreCurrentLayout() }
-    @objc private func convertFullscreenApps() { spaces.convertFullscreenApps() }
 
     @objc private func toggleSync() { syncAll.toggle(); rebuildMenu() }
     @objc private func toggleSmooth() { smooth.toggle(); rebuildMenu() }

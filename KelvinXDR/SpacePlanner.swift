@@ -272,6 +272,7 @@ struct SpaceWriteCircuit: Equatable {
 enum RestoreBlockReason: Equatable {
     case topologyMismatch
     case sharedSpaceDomain
+    case experimentalWritesDisabled
     case automaticRestoreDisabled
     case missingCapabilities
     case writeCircuitOpen
@@ -494,11 +495,15 @@ enum SpacePlanner {
 
     static func restoreEligibility(snapshotTopology: PhysicalTopologyID,
                                    currentTopology: PhysicalTopologyID,
-                                   mode: ManagedSpaceMode, automaticEnabled: Bool,
+                                   mode: ManagedSpaceMode, experimentalWritesEnabled: Bool,
+                                   automaticEnabled: Bool,
                                    capabilities: SpaceCapabilities,
                                    circuitOpen: Bool) -> RestoreEligibility {
         guard snapshotTopology == currentTopology else { return .blocked(.topologyMismatch) }
         guard mode != .sharedMain else { return .blocked(.sharedSpaceDomain) }
+        guard experimentalWritesEnabled else {
+            return .blocked(.experimentalWritesDisabled)
+        }
         guard automaticEnabled else { return .blocked(.automaticRestoreDisabled) }
         guard capabilities.canRestore else { return .blocked(.missingCapabilities) }
         guard !circuitOpen else { return .blocked(.writeCircuitOpen) }

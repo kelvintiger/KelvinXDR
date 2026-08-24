@@ -17,6 +17,7 @@ private enum LayoutOperationFailure: Error, CustomStringConvertible {
 
 final class SpaceLayoutManager {
     static let automaticRestoreKey = "AutomaticallyRestoreSpaceLayouts"
+    static let experimentalWritesKey = "ExperimentalSpaceWritesEnabled"
 
     private enum Operation: String {
         case saving = "saving"
@@ -37,6 +38,7 @@ final class SpaceLayoutManager {
     private let store: SnapshotStore
     private let queue = DispatchQueue(label: "KelvinXDR.spaces", qos: .utility)
 
+    private var releaseGate: ExperimentalSpaceWriteGate
     private var topologyGate = TopologyGate()
     private var debouncer = TopologyDebouncer(enabled: false)
     private var pendingRestore: DispatchWorkItem?
@@ -51,6 +53,12 @@ final class SpaceLayoutManager {
 
     init(store: SnapshotStore = SnapshotStore(directory: SnapshotStore.defaultDirectory)) {
         self.store = store
+        let defaults = UserDefaults.standard
+        releaseGate = ExperimentalSpaceWriteGate(
+            writesEnabled: defaults.bool(forKey: Self.experimentalWritesKey),
+            automaticRestoreEnabled: defaults.bool(forKey: Self.automaticRestoreKey))
+        // A stale automatic preference from the prototype cannot bypass the new release gate.
+        defaults.set(releaseGate.automaticRestoreEnabled, forKey: Self.automaticRestoreKey)
     }
 
     // MARK: - Capabilities and preference
@@ -69,19 +77,39 @@ final class SpaceLayoutManager {
             highQualityTitles: ax.highQualityTitles)
     }
 
-    var automaticRestoreEnabled: Bool {
-        get { UserDefaults.standard.bool(forKey: Self.automaticRestoreKey) }
+    var experimentalWritesEnabled: Bool {
+        get { releaseGate.writesEnabled }
         set {
-            UserDefaults.standard.set(newValue, forKey: Self.automaticRestoreKey)
-            debouncer.setEnabled(newValue)
+            releaseGate.setWritesEnabled(newValue)
+            UserDefaults.standard.set(releaseGate.writesEnabled,
+                                      forKey: Self.experimentalWritesKey)
             if !newValue {
-                pendingRestore?.cancel()
-                pendingRestore = nil
-                operationCoordinator.cancelPendingTopology()
+                UserDefaults.standard.set(false, forKey: Self.automaticRestoreKey)
+                debouncer.setEnabled(false)
+                cancelPendingAutomaticWork()
             }
-            log(newValue ? "automatic restoration enabled" : "automatic restoration disabled")
+            log(newValue ? "experimental Space writes enabled" : "experimental Space writes disabled")
             onChange?()
         }
+    }
+
+    var automaticRestoreEnabled: Bool {
+        get { releaseGate.automaticRestoreEnabled }
+        set {
+            releaseGate.setAutomaticRestoreEnabled(newValue)
+            let enabled = releaseGate.automaticRestoreEnabled
+            UserDefaults.standard.set(enabled, forKey: Self.automaticRestoreKey)
+            debouncer.setEnabled(enabled)
+            if !enabled { cancelPendingAutomaticWork() }
+            log(enabled ? "automatic restoration enabled" : "automatic restoration disabled")
+            onChange?()
+        }
+    }
+
+    private func cancelPendingAutomaticWork() {
+        pendingRestore?.cancel()
+        pendingRestore = nil
+        operationCoordinator.cancelPendingTopology()
     }
 
     var capabilityStatusText: String? {
@@ -93,6 +121,7 @@ final class SpaceLayoutManager {
         }
         let caps = capabilities
         if !caps.canInventory { return caps.unavailableReasons.first ?? "Space inventory unavailable" }
+        if !experimentalWritesEnabled { return "Experimental Space writes are disabled in Settings" }
         if !caps.canRestore { return caps.unavailableReasons.first ?? "Space restoration unavailable" }
         return nil
     }
@@ -101,11 +130,13 @@ final class SpaceLayoutManager {
         capabilities.canSave && !isOperating && detectedMode != .sharedMain
     }
     var canRestore: Bool {
-        capabilities.canRestore && !isOperating && !writesDisabledForSession
+        experimentalWritesEnabled && capabilities.canRestore
+            && !isOperating && !writesDisabledForSession
             && detectedMode != .sharedMain
     }
     var canConvert: Bool {
-        capabilities.canConvert && !isOperating && !writesDisabledForSession
+        experimentalWritesEnabled && capabilities.canConvert
+            && !isOperating && !writesDisabledForSession
             && detectedMode != .sharedMain
     }
 
@@ -264,7 +295,7 @@ final class SpaceLayoutManager {
 
     // MARK: - Restore
 
-    func restoreCurrentLayout() { restoreSaved(reason: "manual menu action", automatic: false) }
+    func restoreCurrentLayout() { restoreSaved(reason: "manual Settings action", automatic: false) }
 
     func restoreProfile(named name: String?, in topology: PhysicalTopologyID) {
         guard topology == Self.currentTopology() else {
@@ -290,7 +321,7 @@ final class SpaceLayoutManager {
     }
 
     private func startRestore(_ snapshot: SpaceSnapshot, reason: String, automatic: Bool) {
-        guard capabilities.canRestore, !writesDisabledForSession else {
+        guard experimentalWritesEnabled, capabilities.canRestore, !writesDisabledForSession else {
             if !automatic { showSummary(capabilityStatusText ?? "Space restoration is unavailable.") }
             return
         }
@@ -304,6 +335,9 @@ final class SpaceLayoutManager {
 
     private func runRestore(_ snapshot: SpaceSnapshot, reason: String,
                             automatic: Bool) -> String {
+        guard experimentalWritesEnabled else {
+            return "Restore cancelled: experimental Space writes are disabled"
+        }
         if automatic, !automaticRestoreEnabled { return "Automatic restore cancelled before acting" }
         guard Self.currentTopology() == snapshot.topologyID else {
             return "Restore failed: physical topology no longer matches the profile"
@@ -314,12 +348,16 @@ final class SpaceLayoutManager {
         publishMode(state.mode)
         let eligibility = SpacePlanner.restoreEligibility(
             snapshotTopology: snapshot.topologyID, currentTopology: Self.currentTopology(),
-            mode: state.mode, automaticEnabled: automatic ? automaticRestoreEnabled : true,
+            mode: state.mode, experimentalWritesEnabled: experimentalWritesEnabled,
+            automaticEnabled: automatic ? automaticRestoreEnabled : true,
             capabilities: capabilities, circuitOpen: writeCircuit.isOpen)
         guard eligibility == .allowed else { return "Restore failed: \(eligibility)" }
 
         var plan = SpacePlanner.plan(snapshot, displays: state.displays, windows: state.windows)
         if plan.deficits.contains(where: { $0.count > 0 }) {
+            guard experimentalWritesEnabled else {
+                return "Restore cancelled before desktop creation: experimental Space writes are disabled"
+            }
             let creation = MissionControlDesktopCreator.create(plan.deficits)
             guard creation.succeeded else {
                 return "Restore failed before moving windows: created \(creation.created)/"
@@ -347,6 +385,10 @@ final class SpaceLayoutManager {
             }
             guard Self.currentTopology() == snapshot.topologyID else {
                 failures.append("physical topology changed during restore")
+                break
+            }
+            guard experimentalWritesEnabled else {
+                failures.append("experimental Space writes were disabled")
                 break
             }
             guard capabilities.canRestore else {
@@ -386,7 +428,7 @@ final class SpaceLayoutManager {
     // MARK: - Explicit fullscreen conversion
 
     func convertFullscreenApps() {
-        guard capabilities.canConvert, !writesDisabledForSession else {
+        guard experimentalWritesEnabled, capabilities.canConvert, !writesDisabledForSession else {
             return showSummary(capabilityStatusText ?? "Fullscreen conversion is unavailable.")
         }
         guard begin(.converting) else { return }
@@ -428,7 +470,8 @@ final class SpaceLayoutManager {
     }
 
     private func executeConversion(returningFocusTo previousFrontmost: NSRunningApplication?) {
-        guard Self.currentTopology() != DisplayTopology.none,
+        guard experimentalWritesEnabled,
+              Self.currentTopology() != DisplayTopology.none,
               case .success(var state) = readLiveState() else {
             return finish("Conversion failed before acting: inventory unavailable", alert: true)
         }
@@ -441,6 +484,10 @@ final class SpaceLayoutManager {
 
         // This is the safety boundary: every desktop exists and is verified before the first
         // AXFullScreen write destroys a type-4 Space.
+        guard experimentalWritesEnabled else {
+            return finish("Conversion cancelled before desktop creation: experimental Space writes "
+                          + "are disabled", alert: true)
+        }
         let creation = MissionControlDesktopCreator.create(
             plan.deficits, returningFocusTo: previousFrontmost)
         guard creation.succeeded, case .success(let refreshed) = readLiveState() else {
@@ -461,7 +508,8 @@ final class SpaceLayoutManager {
         var converted = 0
         var failed: [String] = []
         for candidate in plan.candidates {
-            guard Self.currentTopology() == topology, !writeCircuit.isOpen,
+            guard experimentalWritesEnabled, Self.currentTopology() == topology,
+                  !writeCircuit.isOpen,
                   capabilities.canConvert else {
                 failed.append("runtime state changed; remaining windows were left untouched")
                 break
@@ -596,12 +644,14 @@ final class SpaceLayoutManager {
     }
 
     private func verifyMove(window: UInt32, to target: UInt64) -> Bool {
+        guard experimentalWritesEnabled else { return false }
         if case .success(let current) = SkyLightSpaces.membership(forWindow: window),
            current == [target] { return true }
         let started = Date()
         var attempt = 1
         while moveRetry.shouldAttempt(number: attempt,
                                       elapsed: Date().timeIntervalSince(started)) {
+            guard experimentalWritesEnabled else { return false }
             guard case .success = SkyLightSpaces.submitMove([window], toNormalSpace: target) else {
                 return false
             }
@@ -618,6 +668,7 @@ final class SpaceLayoutManager {
                 writeCircuit.recordVerifiedMove()
                 return true
             }
+            guard experimentalWritesEnabled else { return false }
             writeCircuit.recordVerificationFailure()
             if writeCircuit.isOpen {
                 publishCircuitOpen()
@@ -629,10 +680,12 @@ final class SpaceLayoutManager {
     }
 
     private func verifyFrame(pid: Int32, window: UInt32, target: CGRect) -> Bool {
+        guard experimentalWritesEnabled else { return false }
         let started = Date()
         var attempt = 1
         while geometryRetry.shouldAttempt(number: attempt,
                                           elapsed: Date().timeIntervalSince(started)) {
+            guard experimentalWritesEnabled else { return false }
             guard case .success = WindowAccessibility.setFrame(pid: pid, windowID: window,
                                                                frame: target) else { return false }
             Thread.sleep(forTimeInterval: 0.12)

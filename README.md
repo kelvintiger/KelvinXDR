@@ -79,9 +79,9 @@ stands down and returns when the backlight does. With auto-brightness on, a dimm
 lowers the backlight and takes the boost with it. Turn auto-brightness off in System
 Settings to hold the boost regardless.
 
-**Space Layout Protection (off by default).** Remembers your Mission Control desktops per
-monitor setup and puts them back when that setup returns, so undocking no longer scrambles
-the arrangement you fixed last time. See below.
+**Space Layout Protection (Experimental, Settings only).** Saves Mission Control layouts per
+monitor setup. Every Space write is behind a separate opt-in that defaults off; Sequoia,
+Tahoe, and macOS 27 write behavior is not production-validated. See below.
 
 **Steps aside on request.** The exclusion list is empty by default: a single corner pixel
 cannot cover anything, so there is nothing to step aside from. Name an app in it and the
@@ -101,7 +101,7 @@ video.
 A single pixel in a corner cannot cover anything, and gamma is applied at scanout after
 compositing, so it brightens protected planes too. Both problems disappear by construction.
 
-## Space Layout Protection
+## Space Layout Protection (Experimental)
 
 macOS can collapse or reorder Mission Control desktops when displays change. KelvinXDR's
 proof of concept protects the ordered row of **normal desktops** by saving a separate profile
@@ -109,11 +109,18 @@ for each physical display topology and moving normal windows back to their saved
 slots. A Space UUID is recorded as a diagnostic hint, but the visible logical position among
 type-0 normal Spaces is authoritative.
 
-The feature is off by default. Use **Save Current Normal-Space Layout** to capture a profile
-manually. **Restore Normal-Space Layout** applies it immediately. **Automatically Restore
-Layouts** is a separate opt-in toggle for display-topology changes; turning it off cancels
-pending topology work immediately. The proof of concept never automatically learns a
-post-hotplug arrangement.
+The feature has no menu-bar item. Open Settings -> **Space Layout Protection — Experimental**.
+Saving a named profile does not write Spaces and remains available when its read capabilities
+exist. Restore, automatic restoration, desktop creation, and fullscreen conversion remain
+disabled until **Enable Experimental Space Writes** is checked. **Automatically Restore
+Layouts** is a second opt-in nested under that gate; turning either toggle off cancels pending
+topology work immediately. The proof of concept never automatically learns a post-hotplug
+arrangement.
+
+Experimental failures are not guaranteed no-ops. A partially completed operation may leave
+extra normal desktops, moved or resized normal windows, or an app converted out of native
+fullscreen. Verification, retry bounds, and a session circuit breaker limit further writes but
+cannot undo a write that already succeeded.
 
 Restoration creates only missing normal desktops, never deletes extras, moves each confidently
 matched window to its target type-0 Space, verifies membership, then restores the topology's
@@ -122,7 +129,8 @@ saved or display-relative frame. Windows saved as maximized are maximized with n
 
 **Named layouts**
 
-Settings -> **Space Layouts** lists what is saved, one setup at a time. Every setup has an
+Settings -> **Space Layout Protection — Experimental** lists what is saved, one setup at a
+time. Every setup has an
 **Auto-saved** history populated by explicit saves and can also hold named photographs such as
 "Standard", "Docked", or "Presenting". The layout marked ● is authoritative for that exact
 physical setup. All profile reads and mutations are serialized with background layout work.
@@ -163,13 +171,14 @@ frame when possible and reports the manual recovery required.
 The primary development and validation system is macOS Sequoia 15.7.9 with SIP fully enabled.
 The transferred prototype recorded a successful bridged normal-Space move there, verified by
 moving a disposable window away and back and re-reading `SLSCopySpacesForWindows`. The
-corrected implementation must be revalidated on that machine before making a final support
-claim. Other Sequoia 15.7.x releases are expected to share the runtime contract but are not
-claimed as tested.
+corrected implementation later submitted a cross-managed-display move, but membership did not
+reach the target within its verification bound. The disposable window remained on its original
+Space. KelvinXDR therefore does not claim working Space writes on Sequoia. Other Sequoia 15.7.x
+releases are unverified.
 
 Tahoe 26.4+ is an expected forward-compatibility target based on external validation of the
 same bridged operation with SIP enabled. KelvinXDR has not tested Tahoe hardware, so it does
-not claim "verified on Tahoe." Earlier systems retain the existing macOS 13.1 build target,
+not claim "verified on Tahoe." macOS 27 is also untested. Earlier systems retain the existing macOS 13.1 build target,
 but Space writes remain unavailable unless every runtime dependency is independently present.
 The OS version itself never proves or disproves the operation.
 
@@ -237,8 +246,9 @@ security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db 
 
 ## Settings
 
-Sliders and toggles live in the menu bar. Shortcut recording, typed percentages, the EDR
-trigger corner and the excluded-app list live in the settings window (Cmd+, from the menu).
+Everyday display sliders and toggles live in the menu bar. Shortcut recording, typed
+percentages, the EDR trigger corner, the excluded-app list, and all Experimental Space Layout
+Protection controls live in the settings window (Cmd+, from the menu).
 The same preferences are scriptable:
 
 ```bash

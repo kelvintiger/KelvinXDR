@@ -2,9 +2,8 @@
 //  Settings.swift
 //  KelvinXDR
 //
-//  The window exists for the things a menu genuinely cannot hold: a list you edit, and key
-//  combinations you record by pressing them. Everything that fits as a checkbox stayed in the
-//  menu bar, where it is one click away.
+//  The window owns editable lists, recorded shortcuts, and the Settings-only Experimental
+//  Space Layout Protection surface. The menu bar stays focused on everyday display controls.
 //
 //  Built in code rather than a xib — build.sh is a bare swiftc call, and a nib would need a
 //  resource pipeline for one window.
@@ -116,10 +115,25 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var renameProfileMutation: ((String, String, PhysicalTopologyID, @escaping () -> Void) -> Void)?
     var deleteProfileMutation: ((String, PhysicalTopologyID, @escaping () -> Void) -> Void)?
     var layoutMutationsEnabled: (() -> Bool)?
+    var experimentalWritesEnabled: (() -> Bool)?
+    var setExperimentalWritesEnabled: ((Bool) -> Void)?
+    var automaticSpaceRestoreEnabled: (() -> Bool)?
+    var setAutomaticSpaceRestoreEnabled: ((Bool) -> Void)?
+    var spaceCapabilityStatus: (() -> String?)?
+    var canCaptureSpaceLayout: (() -> Bool)?
+    var canRestoreSpaceLayout: (() -> Bool)?
+    var canConvertFullscreenApps: (() -> Bool)?
+    var convertFullscreenApps: (() -> Void)?
 
     private var setupPopup: NSPopUpButton!
     private var profileTable: NSTableView!
-    private var profileMutationButtons: [NSButton] = []
+    private var profileEditingButtons: [NSButton] = []
+    private var captureProfileButton: NSButton!
+    private var restoreProfileButton: NSButton!
+    private var convertFullscreenButton: NSButton!
+    private var experimentalWritesButton: NSButton!
+    private var automaticRestoreButton: NSButton!
+    private var spaceStatusLabel: NSTextField!
     private var setups: [SpaceProfileCatalog.Setup] = []
     /// Rows of the profile table. `name` is nil for the auto-saved profile.
     /// Not private so the test can check what the list renders without showing a window.
@@ -172,8 +186,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
         reloadLevels()
         reloadSetups()
-        let enabled = layoutMutationsEnabled?() ?? true
-        profileMutationButtons.forEach { $0.isEnabled = enabled }
+        reloadSpaceControls()
     }
 
     // MARK: - Space profiles
@@ -295,6 +308,44 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let row = profileTable.selectedRow
         guard row >= 0, row < profileRows.count else { return }
         applyProfile?(profileRows[row].name, setup.topologyID)
+    }
+
+    private func reloadSpaceControls() {
+        let idle = layoutMutationsEnabled?() ?? true
+        let writes = experimentalWritesEnabled?() ?? false
+        let automatic = automaticSpaceRestoreEnabled?() ?? false
+        experimentalWritesButton?.state = writes ? .on : .off
+        // A currently-enabled gate always stays clickable so it can be shut off immediately.
+        experimentalWritesButton?.isEnabled = writes || idle
+        automaticRestoreButton?.state = automatic ? .on : .off
+        automaticRestoreButton?.isEnabled = automatic
+            || (writes && (canRestoreSpaceLayout?() ?? false))
+        captureProfileButton?.isEnabled = canCaptureSpaceLayout?() ?? false
+        restoreProfileButton?.isEnabled = canRestoreSpaceLayout?() ?? false
+        convertFullscreenButton?.isEnabled = canConvertFullscreenApps?() ?? false
+        profileEditingButtons.forEach { $0.isEnabled = idle }
+        if let status = spaceCapabilityStatus?() {
+            spaceStatusLabel?.stringValue = status
+        } else {
+            spaceStatusLabel?.stringValue = writes
+                ? "Experimental Space writes are enabled; outcomes remain unverified."
+                : "Experimental Space writes are disabled."
+        }
+    }
+
+    @objc private func experimentalWritesChanged(_ sender: NSButton) {
+        setExperimentalWritesEnabled?(sender.state == .on)
+        reloadSpaceControls()
+    }
+
+    @objc private func automaticSpaceRestoreChanged(_ sender: NSButton) {
+        setAutomaticSpaceRestoreEnabled?(sender.state == .on)
+        reloadSpaceControls()
+    }
+
+    @objc private func convertFullscreenAppsNow() {
+        convertFullscreenApps?()
+        reloadSpaceControls()
     }
 
     /// Rebuilt rather than updated: displays come and go, and the row count changes with them.
@@ -436,7 +487,25 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         root.addArrangedSubview(corner)
 
         root.addArrangedSubview(NSBox.separator())
-        root.addArrangedSubview(label("Space Layouts", 13, .semibold))
+        root.addArrangedSubview(label("Space Layout Protection — Experimental", 13, .semibold,
+                                      .systemOrange))
+        root.addArrangedSubview(paragraph(
+            "Space writes are not production-validated. A failed restore or conversion may "
+            + "leave extra desktops or partially changed normal windows."))
+
+        experimentalWritesButton = NSButton(
+            checkboxWithTitle: "Enable Experimental Space Writes", target: self,
+            action: #selector(experimentalWritesChanged(_:)))
+        root.addArrangedSubview(experimentalWritesButton)
+
+        automaticRestoreButton = NSButton(
+            checkboxWithTitle: "Automatically Restore Layouts", target: self,
+            action: #selector(automaticSpaceRestoreChanged(_:)))
+        root.addArrangedSubview(automaticRestoreButton)
+
+        spaceStatusLabel = paragraph("Experimental Space writes are disabled.")
+        spaceStatusLabel.textColor = .secondaryLabelColor
+        root.addArrangedSubview(spaceStatusLabel)
         root.addArrangedSubview(paragraph(
             "Layouts stay separate per physical display setup. ● marks the profile restored "
             + "for that exact setup."))
@@ -470,8 +539,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         // Two rows: five buttons do not fit across 400pt without truncating their titles.
         let saveAs = NSButton(title: "Save Current As…", target: self, action: #selector(saveProfile))
+        captureProfileButton = saveAs
         let use = NSButton(title: "Use for This Setup", target: self, action: #selector(useProfile))
         let restoreNow = NSButton(title: "Restore Now", target: self, action: #selector(restoreProfile))
+        restoreProfileButton = restoreNow
         let topRow = NSStackView(views: [saveAs, use, restoreNow])
         topRow.orientation = .horizontal
         topRow.spacing = 8
@@ -483,7 +554,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         bottomRow.orientation = .horizontal
         bottomRow.spacing = 8
         root.addArrangedSubview(bottomRow)
-        profileMutationButtons = [saveAs, use, restoreNow, rename, delete]
+        profileEditingButtons = [use, rename, delete]
+
+        convertFullscreenButton = NSButton(
+            title: "Convert Fullscreen Apps to Dedicated Desktops…", target: self,
+            action: #selector(convertFullscreenAppsNow))
+        root.addArrangedSubview(convertFullscreenButton)
 
         root.addArrangedSubview(NSBox.separator())
         root.addArrangedSubview(label("Pause the boost for these apps", 13, .semibold))
