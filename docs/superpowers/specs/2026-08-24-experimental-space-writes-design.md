@@ -13,9 +13,12 @@ writes off until someone deliberately opts in.
 
 ## Selected approach
 
-Use both visible Experimental labeling and a default-off write gate.
+Keep the feature out of the menu bar and use both visible Experimental labeling in Settings
+and a default-off write gate.
 
-- Rename the menu and submenu to `Space Layout Protection (Experimental)`.
+- Remove the Space Layout Protection item and submenu from the menu bar entirely.
+- Rename the Settings section to `Space Layout Protection — Experimental` and add a concise
+  warning that Space writes are unverified and may leave partially changed window state.
 - Add `Enable Experimental Space Writes` as a separate, unchecked preference.
 - Keep read-only inventory, capability reporting, `--spaces-dump`, and normal-layout Save
   available without the write gate.
@@ -42,11 +45,24 @@ Disabling the gate clears the automatic preference and invalidates pending debou
 Save remains available because it only inventories windows and writes KelvinXDR profile files;
 it does not move windows, create desktops, or change fullscreen state.
 
-## User experience
+## Settings-only user experience
 
-The submenu title continuously identifies the feature as Experimental. The write toggle appears
-before automatic restoration. When the gate is off, Restore, automatic restoration, and Convert
-are disabled; Save remains available when its read capabilities exist.
+Settings is the only user-facing surface for Space Layout Protection. The menu bar contains no
+Space Layout Protection item, status, or action.
+
+The existing Space Layouts profile section becomes `Space Layout Protection — Experimental`.
+It contains, in order:
+
+1. A concise warning about the failed Sequoia verification and possible partial changes.
+2. `Enable Experimental Space Writes`, off by default.
+3. `Automatically Restore Layouts`, separately opt-in and disabled while writes are off.
+4. Existing topology/profile selection and non-Space-writing Save/profile-management controls.
+5. `Restore Now`, disabled while writes are off or runtime capabilities are unavailable.
+6. `Convert Fullscreen Apps to Dedicated Desktops…`, disabled while writes are off or runtime
+   capabilities are unavailable.
+
+Settings receives manager-owned state and mutations through closures, following the existing
+profile architecture. UI controls never modify Space preferences or perform writes directly.
 
 Documentation states that:
 
@@ -62,8 +78,8 @@ Documentation states that:
   eligibility when the experimental gate is disabled.
 - Run `STRICT=1 ./build.sh test` with task-specific module caches if needed.
 - Run a strict full app build without installing or launching.
-- Run `git diff --check` and focused searches confirming the Experimental labels and manager
-  gates are present.
+- Run `git diff --check` and focused searches confirming the menu item is absent and the
+  Settings Experimental labels and manager gates are present.
 - Do not repeat live Space writes, fullscreen conversion, or dock/undock validation as part of
   this release-label change.
 
