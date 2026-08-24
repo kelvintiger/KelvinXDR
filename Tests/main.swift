@@ -189,11 +189,9 @@ settings.values = {
            fraction: 0.3, maxFraction: 1) { _ in }]
 }
 settings.reload()
-if let content = settings.window?.contentView {
-    content.layoutSubtreeIfNeeded()
-    settings.window?.setContentSize(content.fittingSize)
-}
-if let content = settings.window?.contentView {
+// The content lives inside a scroll view now, so measure the stack itself — the scroll view's
+// own size is the window's, which is exactly the thing being capped.
+if let content = settings.contentStack {
     content.layoutSubtreeIfNeeded()
     let fitting = content.fittingSize
     let expected = SettingsWindowController.contentWidth + 40   // 20pt inset each side
@@ -230,8 +228,20 @@ if let content = settings.window?.contentView {
                + "needs \(Int(needed))pt")
     }
 
-    expect((settings.window?.frame.height ?? 0) >= fitting.height,
-           "window is tall enough for its content, so the buttons are not cut off")
+    // The old rule — "the window must be as tall as its content" — is what produced a window
+    // taller than the screen, with the buttons below the bottom edge where no amount of
+    // scrolling could reach them.
+    let visible = (settings.window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 900
+    expect((settings.window?.frame.height ?? 0) <= visible,
+           "window never exceeds the screen, so nothing is cut off the bottom")
+    if let scroll = settings.window?.contentView as? NSScrollView {
+        expect(scroll.documentView === content, "the content scrolls instead of overflowing")
+        expect(scroll.hasVerticalScroller, "and there is a scroller to do it with")
+    } else {
+        expect(false, "settings content is inside a scroll view")
+    }
+    expect(settings.window?.styleMask.contains(.resizable) == true,
+           "and the window can be dragged taller")
 
     // The popup's titles and the stored corner values are parallel lists. Reordering the
     // titles without the values would silently park the EDR trigger in the wrong corner, and
@@ -450,6 +460,406 @@ if let screen = NSScreen.main {
 } else {
     print("  skip  no display attached (CI) — HUD geometry needs a real screen")
 }
+
+// MARK: - Space Layout Protection
+//
+// Policy stays hardware-free. SkyLight, Dock Accessibility, and AX window mutation are not
+// linked into this binary; their narrow adapters consume and return the values tested here.
+
+func topology(_ uuids: String...) -> PhysicalTopologyID { DisplayTopology.fingerprint(uuids) }
+let builtIn = ManagedSpaceDomainID("BUILTIN")
+let external = ManagedSpaceDomainID("EXTERNAL")
+
+section("Topology identity, transient readings, and debounce")
+expect(topology("A", "B") == topology("B", "A"), "physical topology ignores enumeration order")
+expect(topology("A") != topology("A", "B"), "a monitor arrival selects a different profile")
+expect(topology() == DisplayTopology.none && topology("") == DisplayTopology.none,
+       "empty and unreadable display UUIDs are transient none")
+expect(String(reflecting: PhysicalTopologyID.self) != String(reflecting: ManagedSpaceDomainID.self),
+       "physical and managed identities are distinct types even with equal bytes")
+
+var topologyGate = TopologyGate(fingerprint: topology("A"))
+expect(!topologyGate.noticed(DisplayTopology.none), "zero active displays never replaces the last topology")
+expect(topologyGate.fingerprint == topology("A"), "the last real topology survives clamshell sleep")
+expect(topologyGate.noticed(topology("A", "B")), "a real resample commits the new physical topology")
+
+var debounce = TopologyDebouncer(enabled: true)
+let firstToken = debounce.schedule()
+let secondToken = debounce.schedule()
+expect(firstToken != nil && secondToken != nil && firstToken != secondToken,
+       "a flapping notification re-arms debounce")
+expect(!debounce.accept(firstToken!), "the superseded debounce token cannot restore")
+expect(debounce.accept(secondToken!), "only the newest debounce token can restore")
+debounce.setEnabled(false)
+expect(debounce.schedule() == nil && !debounce.accept(secondToken!),
+       "disabling automatic restore immediately cancels pending work")
+debounce.setEnabled(true)
+let consumedToken = debounce.schedule()!
+expect(debounce.consume(consumedToken), "the current debounce token is consumed once")
+expect(!debounce.consume(consumedToken), "a consumed token cannot execute twice")
+
+section("Layout operation serialization and pending topology")
+var coordinator = LayoutOperationCoordinator()
+expect(coordinator.begin(), "the first layout operation starts")
+expect(!coordinator.begin(), "overlapping save, restore, or conversion is rejected")
+coordinator.noteTopologyChange()
+expect(coordinator.hasPendingTopology, "a topology change during work is remembered")
+expect(coordinator.finish(automaticRestoreEnabled: true),
+       "the final topology is re-evaluated after active work finishes")
+expect(!coordinator.isBusy && !coordinator.hasPendingTopology,
+       "finishing returns the coordinator to a clean idle state")
+expect(coordinator.begin(), "a later operation can start after serialization releases")
+coordinator.noteTopologyChange()
+expect(!coordinator.finish(automaticRestoreEnabled: false),
+       "disabling automatic restoration cancels the deferred topology evaluation")
+
+// MARK: fixtures
+
+func win(_ id: UInt32, _ app: String, title: String? = nil, document: String? = nil,
+         _ x: CGFloat = 0, _ y: CGFloat = 0, _ w: CGFloat = 800, _ h: CGFloat = 600,
+         maximized: Bool = false) -> SpaceSnapshot.Window {
+    SpaceSnapshot.Window(windowID: id, pid: 1, bundleID: app, ownerName: app, title: title,
+                         documentIdentity: document,
+                         frame: CGRect(x: x, y: y, width: w, height: h),
+                         relativeFrame: nil, isMaximized: maximized,
+                         restorationFrame: maximized ? CGRect(x: 80, y: 80, width: 900, height: 700) : nil)
+}
+
+func live(_ id: UInt32, _ app: String, title: String? = nil, document: String? = nil,
+          _ x: CGFloat = 0, _ y: CGFloat = 0, _ w: CGFloat = 800, _ h: CGFloat = 600,
+          spaces: [UInt64] = [], fullscreen: Bool = false, reachable: Bool = true,
+          standard: Bool = true, stageManager: Bool = false,
+          canSetFullscreen: Bool = true, canSetGeometry: Bool = true) -> LiveWindow {
+    LiveWindow(id: id, pid: 1, bundleID: app, ownerName: app, title: title,
+               documentIdentity: document, frame: CGRect(x: x, y: y, width: w, height: h),
+               spaceIDs: spaces, isFullscreen: fullscreen, isAXReachable: reachable,
+               isStandardWindow: standard, isStageManagerSpecial: stageManager,
+               canSetFullscreen: canSetFullscreen, canSetPosition: canSetGeometry,
+               canSetSize: canSetGeometry)
+}
+
+func snapshot(_ displays: [(ManagedSpaceDomainID, String?, [(String, [SpaceSnapshot.Window])])],
+              topologyID: PhysicalTopologyID = PhysicalTopologyID("T")) -> SpaceSnapshot {
+    SpaceSnapshot(topologyID: topologyID, savedAt: Date(timeIntervalSince1970: 1_700_000_000),
+                  displays: displays.map { display in
+        SpaceSnapshot.Display(managedDisplayID: display.0, physicalDisplayUUID: display.1,
+                              spaces: display.2.enumerated().map { index, space in
+            SpaceSnapshot.Space(spaceUUID: space.0, logicalIndex: index, windows: space.1)
+        })
+    })
+}
+
+let saved = snapshot([(builtIn, "BUILTIN", [("s1", [win(10, "com.apple.Safari", title: "Docs")]),
+                                             ("s2", [win(11, "com.apple.dt.Xcode")])]),
+                      (external, "EXTERNAL", [("s3", [])])])
+
+section("Normal-window snapshot schema and migration")
+if let encoded = try? JSONEncoder.snapshots.encode(saved),
+   let decoded = try? JSONDecoder.snapshots.decode(SpaceSnapshot.self, from: encoded) {
+    expect(decoded == saved, "schema 4 round-trips normal-window presentation")
+    expect(decoded.spaceCount == 3 && decoded.windowCount == 2, "normal counts survive the trip")
+} else { expect(false, "schema 4 snapshot encodes and decodes") }
+
+let legacyJSON = """
+[{"schemaVersion":3,"topologyID":"LEGACY","savedAt":"2026-08-20T00:00:00Z","displays":[
+ {"displayUUID":"BUILTIN","spaces":[{"spaceUUID":"d0","logicalIndex":0,"windows":[
+  {"windowID":7,"pid":2,"bundleID":"com.apple.Safari","ownerName":"Safari","title":"Old",
+   "frame":[[10,20],[800,600]]}]}],"fullscreen":[
+  {"windowID":99,"pid":2,"bundleID":"com.apple.Safari","ownerName":"Safari","title":"FS",
+   "frame":[[0,0],[100,100]]}]}]}]
+"""
+if let old = try? JSONDecoder.snapshots.decode([SpaceSnapshot].self, from: Data(legacyJSON.utf8)) {
+    expect(old.count == 1 && old[0].windowCount == 1,
+           "schema 3 normal windows decode while legacy fullscreen arrays are ignored")
+    expect(old[0].displays[0].managedDisplayID == builtIn,
+           "legacy displayUUID migrates to managed-domain identity")
+    expect(old[0].displays[0].spaces[0].windows[0].isMaximized == false,
+           "legacy windows receive safe normal presentation defaults")
+} else { expect(false, "schema 3 snapshots migrate") }
+
+expect(saved.signature == snapshot([(external, "EXTERNAL", [("s3", [])]),
+                                    (builtIn, "BUILTIN", [("s1", [win(10, "com.apple.Safari", title: "Other")]),
+                                                          ("s2", [win(11, "com.apple.dt.Xcode")])])]).signature,
+       "signature ignores display enumeration and intermittent titles")
+
+let storeDirectory = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appendingPathComponent("KelvinXDRSpaceTests-\(getpid())")
+let store = SnapshotStore(directory: storeDirectory, autoLimit: 3)
+func stamped(_ index: Int, topologyID: PhysicalTopologyID = PhysicalTopologyID("T")) -> SpaceSnapshot {
+    var copy = saved
+    copy.topologyID = topologyID
+    copy.savedAt = Date(timeIntervalSince1970: 1_700_000_000 + Double(index))
+    return copy
+}
+for index in 0..<5 { store.saveAuto(stamped(index)) }
+expect(store.load(PhysicalTopologyID("T")).auto.count == 3,
+       "auto history remains bounded and newest-first")
+store.saveProfile(named: "Standard", stamped(99))
+expect(store.load(PhysicalTopologyID("T")).active?.savedAt
+       == Date(timeIntervalSince1970: 1_700_000_099), "a selected named profile remains authoritative")
+
+DispatchQueue.concurrentPerform(iterations: 12) { index in
+    store.saveProfile(named: "Concurrent \(index)", stamped(200 + index))
+}
+expect(store.load(PhysicalTopologyID("T")).profiles.count == 13,
+       "serialized profile mutations do not lose concurrent read-modify-writes")
+store.renameProfile("Standard", to: "Baseline", in: PhysicalTopologyID("T"))
+expect(store.load(PhysicalTopologyID("T")).profiles.contains(where: { $0.name == "Baseline" }),
+       "serialized rename keeps the profile snapshot")
+store.select(nil, in: PhysicalTopologyID("T"))
+expect(store.load(PhysicalTopologyID("T")).active?.savedAt
+       == Date(timeIntervalSince1970: 1_700_000_004),
+       "selecting Auto-saved returns to the newest bounded history entry")
+store.select("Baseline", in: PhysicalTopologyID("T"))
+store.deleteProfile(named: "Baseline", in: PhysicalTopologyID("T"))
+expect(store.load(PhysicalTopologyID("T")).selected == nil,
+       "deleting the selected profile safely falls back to Auto-saved")
+
+var future = saved
+future.schemaVersion = SpaceSnapshot.currentSchema + 1
+future.topologyID = PhysicalTopologyID("FUTURE")
+store.saveAuto(future)
+expect(store.load(PhysicalTopologyID("FUTURE")).active == nil,
+       "future snapshot schemas are refused rather than guessed")
+try? FileManager.default.removeItem(at: storeDirectory)
+
+section("Structured capabilities and runtime-driven platform policy")
+let allCapabilities = SpaceCapabilities.allAvailable
+expect(allCapabilities.canInventory && allCapabilities.canRestore && allCapabilities.canConvert,
+       "independent capabilities compose into save, restore, and conversion")
+var missingMovement = allCapabilities
+missingMovement.normalSpaceMovement = .unavailable("move selector missing")
+expect(missingMovement.canInventory && !missingMovement.canRestore && !missingMovement.canConvert,
+       "missing movement preserves read-only inventory and disables writes")
+var missingTitles = allCapabilities
+missingTitles.highQualityTitles = .unavailable("Screen Recording not granted")
+expect(missingTitles.canRestore, "optional high-quality titles never gate safe restoration")
+var missingMembership = allCapabilities
+missingMembership.windowSpaceMembership = .unavailable("membership symbol missing")
+expect(!missingMembership.canInventory && !missingMembership.canSave,
+       "missing membership disables capture without affecting unrelated app behavior")
+var missingCreator = allCapabilities
+missingCreator.missingDesktopCreation = .unavailable("Dock AX identifiers missing")
+expect(!missingCreator.canRestore && !missingCreator.canConvert,
+       "missing Dock creation capability disables every operation that may need a desktop")
+var missingAX = allCapabilities
+missingAX.accessibilityWindowIdentification = .unavailable("Accessibility denied")
+expect(!missingAX.canSave && !missingAX.canRestore && !missingAX.canConvert,
+       "missing Accessibility leaves Space mutation unavailable")
+var missingGeometry = allCapabilities
+missingGeometry.normalWindowGeometry = .unavailable("AXSize unavailable")
+expect(!missingGeometry.canRestore && !missingGeometry.canConvert,
+       "missing normal geometry prevents half-restored layouts")
+var missingConversion = allCapabilities
+missingConversion.fullscreenConversion = .unavailable("AXFullScreen unavailable")
+expect(missingConversion.canRestore && !missingConversion.canConvert,
+       "fullscreen conversion capability is independent of normal restoration")
+expect(PlatformPolicy.tier(major: 15, minor: 7, patch: 9) == .primarySequoia,
+       "Sequoia 15.7.9 is the primary target")
+expect(PlatformPolicy.tier(major: 15, minor: 7, patch: 4) == .expectedSequoia,
+       "other Sequoia 15.7 releases are expected but not claimed as tested")
+expect(PlatformPolicy.tier(major: 26, minor: 4, patch: 0) == .expectedTahoe,
+       "Tahoe 26.4 is an expected forward-compatible target")
+expect(!PlatformPolicy.hardBlocksWrites(major: 14),
+       "OS major version alone never hard-rejects runtime-proven operations")
+
+section("Ordered type-0 inventory and managed-domain mode")
+let mixed = SpacePlanner.inventory(
+    managedDisplayID: builtIn,
+    descriptors: [LiveSpaceDescriptor(id: 1, uuid: "n1", type: 0),
+                  LiveSpaceDescriptor(id: 2, uuid: "fs", type: 4, tileWindows: [20]),
+                  LiveSpaceDescriptor(id: 3, uuid: "n2", type: 0),
+                  LiveSpaceDescriptor(id: 4, uuid: "split", type: 4, tileWindows: [21, 22])])
+expect(mixed.spaces.map { $0.id } == [1, 3], "type-0 normal Spaces retain Mission Control order")
+expect(mixed.fullscreen.map { $0.spaceID } == [2, 4], "type-4 data is classified separately")
+expect(!Set(mixed.spaces.map { $0.id }).contains(2), "type-4 Spaces can never become move targets")
+expect(ManagedSpaceMode.detect([mixed]) == .separate, "opaque display domains support separate rows")
+expect(ManagedSpaceMode.detect([LiveDisplay(managedDisplayID: .main, spaces: mixed.spaces)]) == .sharedMain,
+       "literal Main is recognized as one shared Mission Control row")
+expect(ManagedSpaceMode.detect([]) == .unavailable, "empty SkyLight inventory is not a Space-domain mode")
+
+section("Logical normal-Space slots are authoritative")
+let twoDesktops = snapshot([(builtIn, "BUILTIN", [("s1", []), ("s2", [])])])
+let reordered = [LiveDisplay(managedDisplayID: builtIn,
+                             spaces: [LiveSpace(id: 8, uuid: "s2"), LiveSpace(id: 7, uuid: "s1")])]
+let resolved = SpacePlanner.resolve(twoDesktops, on: reordered)
+expect(resolved[SpacePlanner.key(builtIn, 0)] == 8
+       && resolved[SpacePlanner.key(builtIn, 1)] == 7,
+       "surviving but reordered UUIDs resolve by visible logical slot, not UUID identity")
+let short = [LiveDisplay(managedDisplayID: builtIn, spaces: [LiveSpace(id: 40, uuid: "new")])]
+expect(SpacePlanner.resolve(twoDesktops, on: short)[SpacePlanner.key(builtIn, 1)] == nil,
+       "a missing logical slot remains unresolved until its desktop is created")
+let extra = [LiveDisplay(managedDisplayID: builtIn,
+                         spaces: [LiveSpace(id: 1, uuid: "a"), LiveSpace(id: 2, uuid: "b"),
+                                  LiveSpace(id: 3, uuid: "extra")])]
+expect(SpacePlanner.deficits(twoDesktops, on: extra).first?.count == 0,
+       "extra normal desktops remain and are never deleted")
+
+section("Conservative window matching")
+expect(SpacePlanner.match([win(10, "Safari", title: "Old")],
+                          to: [live(10, "Safari", title: "New")])[0] == 10,
+       "session window ID plus app identity wins")
+expect(SpacePlanner.match([win(10, "Safari", document: "file:///docs/a")],
+                          to: [live(50, "Safari", document: "file:///docs/a")])[0] == 50,
+       "stable document identity survives window renumbering")
+expect(SpacePlanner.match([win(10, "Terminal", title: "bash", 100, 100)],
+                          to: [live(50, "Terminal", title: "bash", 110, 100),
+                               live(51, "Terminal", title: "bash", 900, 900)])[0] == 50,
+       "frame proximity only breaks a credible title tie")
+expect(SpacePlanner.match([win(10, "Terminal"), win(11, "Terminal")],
+                          to: [live(50, "Terminal"), live(51, "Terminal")]).isEmpty,
+       "ambiguous same-app windows are untouched")
+expect(SpacePlanner.match([win(10, "Terminal", title: "bash", 100, 100)],
+                          to: [live(50, "Terminal", title: "bash", 90, 100),
+                               live(51, "Terminal", title: "bash", 110, 100)]).isEmpty,
+       "an equal frame tie is still ambiguous")
+
+section("Exact-profile gating and normal restore planning")
+expect(SpacePlanner.restoreEligibility(snapshotTopology: topology("A"), currentTopology: topology("B"),
+                                       mode: .separate, automaticEnabled: true,
+                                       capabilities: allCapabilities, circuitOpen: false)
+       == .blocked(.topologyMismatch), "a profile never crosses physical topologies")
+expect(SpacePlanner.restoreEligibility(snapshotTopology: topology("A"), currentTopology: topology("A"),
+                                       mode: .sharedMain, automaticEnabled: true,
+                                       capabilities: allCapabilities, circuitOpen: false)
+       == .blocked(.sharedSpaceDomain), "shared Main mode disables per-display restoration")
+expect(SpacePlanner.restoreEligibility(snapshotTopology: topology("A"), currentTopology: topology("A"),
+                                       mode: .separate, automaticEnabled: false,
+                                       capabilities: allCapabilities, circuitOpen: false)
+       == .blocked(.automaticRestoreDisabled), "a scheduled restore rechecks the opt-in toggle")
+expect(SpacePlanner.restoreEligibility(snapshotTopology: topology("A"), currentTopology: topology("A"),
+                                       mode: .separate, automaticEnabled: true,
+                                       capabilities: missingMovement, circuitOpen: false)
+       == .blocked(.missingCapabilities), "a scheduled restore rechecks runtime capabilities")
+expect(SpacePlanner.restoreEligibility(snapshotTopology: topology("A"), currentTopology: topology("A"),
+                                       mode: .separate, automaticEnabled: true,
+                                       capabilities: allCapabilities, circuitOpen: true)
+       == .blocked(.writeCircuitOpen), "the session circuit is checked before automatic writes")
+
+let restoreTarget = snapshot([(builtIn, "BUILTIN", [("s1", [win(10, "Safari", title: "Docs")]),
+                                                      ("s2", [win(11, "Xcode", title: "Project")])])])
+let restoreDisplays = [LiveDisplay(managedDisplayID: builtIn,
+                                   spaces: [LiveSpace(id: 1, uuid: "s2"),
+                                            LiveSpace(id: 2, uuid: "s1")])]
+let restorePlan = SpacePlanner.plan(restoreTarget, displays: restoreDisplays,
+                                    windows: [live(10, "Safari", title: "Docs", spaces: [2]),
+                                              live(11, "Xcode", title: "Project", spaces: [1])])
+expect(restorePlan.moves.map { $0.window } == [10, 11]
+       && restorePlan.moves.map { $0.space } == [1, 2],
+       "normal windows move into saved logical slots despite surviving reordered UUIDs")
+
+section("Fullscreen conversion eligibility and ordering")
+let conversionDisplay = LiveDisplay(
+    managedDisplayID: builtIn, spaces: [LiveSpace(id: 1, uuid: "desktop")],
+    fullscreen: [LiveFullscreen(spaceID: 100, index: 0, tileWindows: [20]),
+                 LiveFullscreen(spaceID: 101, index: 1, tileWindows: [21, 22]),
+                 LiveFullscreen(spaceID: 102, index: 2, tileWindows: []),
+                 LiveFullscreen(spaceID: 103, index: 3, tileWindows: [23]),
+                 LiveFullscreen(spaceID: 104, index: 4, tileWindows: [24]),
+                 LiveFullscreen(spaceID: 105, index: 5, tileWindows: [25]),
+                 LiveFullscreen(spaceID: 106, index: 6, tileWindows: [26]),
+                 LiveFullscreen(spaceID: 107, index: 7, tileWindows: [27]),
+                 LiveFullscreen(spaceID: 108, index: 8, tileWindows: [28])])
+let conversionWindows = [
+    live(20, "Safari", title: "Disposable", spaces: [100], fullscreen: true),
+    live(23, "Panel", spaces: [103], fullscreen: true, standard: false),
+    live(24, "Stage", spaces: [104], fullscreen: true, stageManager: true),
+    live(25, "Sticky", spaces: [105, 1], fullscreen: true),
+    live(26, "Hidden", spaces: [106], fullscreen: true, reachable: false),
+    live(27, "Odd", spaces: [107], fullscreen: false),
+    live(28, "Fixed", spaces: [108], fullscreen: true, canSetGeometry: false),
+]
+let conversion = SpacePlanner.conversionPlan(displays: [conversionDisplay],
+                                             windows: conversionWindows,
+                                             capabilities: allCapabilities)
+expect(conversion.candidates.map { $0.window } == [20],
+       "only a confidently identified ordinary single-window fullscreen app is eligible")
+expect(conversion.deficits == [SpacePlanner.Deficit(managedDisplayID: builtIn, count: 1)],
+       "one dedicated normal desktop is created per eligible fullscreen app")
+expect(conversion.actions.first == .createDesktops(conversion.deficits),
+       "all missing desktops are created before any app exits fullscreen")
+expect(conversion.actions.last == .convert(conversion.candidates[0]),
+       "eligible windows convert conservatively and serially")
+let skipReasons = Set(conversion.skipped.map { $0.reason })
+expect(skipReasons.contains(.splitView) && skipReasons.contains(.ambiguousOccupant)
+       && skipReasons.contains(.panel) && skipReasons.contains(.stageManager)
+       && skipReasons.contains(.allDesktops), "unsafe conversion cases have explicit skip reasons")
+expect(skipReasons.contains(.inaccessible), "AX-inaccessible fullscreen windows are skipped")
+expect(skipReasons.contains(.unsupportedApp), "apps that cannot explicitly exit fullscreen are skipped")
+expect(skipReasons.contains(.geometryUnavailable), "windows that cannot resize are skipped")
+expect(conversion.candidates[0].targetLogicalIndex == 1,
+       "dedicated desktops append after the existing ordered normal slots")
+
+let emptyConversionRow = LiveDisplay(
+    managedDisplayID: external, spaces: [LiveSpace(id: 2, uuid: "external-desktop")])
+let alignedConversion = SpacePlanner.conversionPlan(
+    displays: [emptyConversionRow, conversionDisplay], windows: conversionWindows,
+    capabilities: allCapabilities)
+expect(alignedConversion.deficits == [
+    SpacePlanner.Deficit(managedDisplayID: external, count: 0),
+    SpacePlanner.Deficit(managedDisplayID: builtIn, count: 1),
+], "conversion deficits retain zero-count rows so Dock display indices stay aligned")
+expect(alignedConversion.actions.first == .createDesktops(alignedConversion.deficits),
+       "desktop creation receives the complete managed-display row shape")
+
+let unavailableConversion = SpacePlanner.conversionPlan(
+    displays: [conversionDisplay], windows: conversionWindows, capabilities: missingConversion)
+expect(unavailableConversion.candidates.isEmpty,
+       "missing conversion capability leaves every fullscreen app untouched")
+expect(unavailableConversion.skipped.allSatisfy { $0.reason == .missingCapabilities },
+       "capability failure is explicit in the conversion summary")
+
+let sharedConversion = SpacePlanner.conversionPlan(
+    displays: [LiveDisplay(managedDisplayID: .main, spaces: conversionDisplay.spaces,
+                           fullscreen: conversionDisplay.fullscreen)],
+    windows: conversionWindows, capabilities: allCapabilities)
+expect(sharedConversion.candidates.isEmpty
+       && sharedConversion.skipped.allSatisfy { $0.reason == .sharedSpaceDomain },
+       "shared Main mode leaves fullscreen windows untouched")
+
+section("Maximized and restored-frame calculations")
+let visible = CGRect(x: 0, y: 24, width: 1728, height: 1080)
+let normalFrame = CGRect(x: 172.8, y: 132, width: 864, height: 540)
+let relative = WindowGeometry.relative(normalFrame, in: visible)
+expect(WindowGeometry.absolute(relative, in: visible).approximatelyEquals(normalFrame),
+       "display-relative geometry round-trips")
+let resizedVisible = CGRect(x: 1920, y: 24, width: 1440, height: 900)
+let resized = WindowGeometry.absolute(relative, in: resizedVisible)
+expect(resized.minX > resizedVisible.minX && resized.maxX <= resizedVisible.maxX,
+       "saved normal frames adapt to the target topology's visible frame")
+expect(WindowGeometry.maximizedFrame(in: resizedVisible) == resizedVisible,
+       "maximization uses normal-window position and size")
+expect(WindowGeometry.isMaximized(resizedVisible.insetBy(dx: 1, dy: 1), in: resizedVisible),
+       "geometry verification tolerates compositor rounding")
+expect(WindowGeometry.accessibilityFrame(fromCocoa: CGRect(x: 0, y: 0, width: 100, height: 80),
+                                         mainDisplayHeight: 1000).minY == 920,
+       "AppKit-to-Accessibility coordinate conversion is explicit and testable")
+expect(WindowGeometry.usable(CGRect(x: -500, y: -500, width: 3000, height: 2000),
+                             in: visible) == visible,
+       "unusable oversized restoration frames clamp to the visible display")
+let minimumUsable = WindowGeometry.usable(CGRect(x: 2000, y: 2000, width: 10, height: 10),
+                                          in: visible)
+expect(minimumUsable.width == 120 && minimumUsable.height == 120,
+       "tiny saved frames regain a usable minimum size")
+expect(minimumUsable.maxX <= visible.maxX && minimumUsable.maxY <= visible.maxY,
+       "offscreen saved frames return fully inside the target display")
+expect(!WindowGeometry.isMaximized(visible.insetBy(dx: 20, dy: 20), in: visible),
+       "a merely large normal window is not mislabeled maximized")
+
+section("Bounded retries and Space-write circuit breaker")
+let retry = RetryPolicy(maxAttempts: 3, wallClockBudget: 10)
+expect(retry.shouldAttempt(number: 3, elapsed: 9.9), "the configured final attempt is allowed")
+expect(!retry.shouldAttempt(number: 4, elapsed: 1) && !retry.shouldAttempt(number: 2, elapsed: 11),
+       "attempt and wall-clock bounds both stop retries")
+var circuit = SpaceWriteCircuit(maxVerificationFailures: 3)
+circuit.recordVerificationFailure()
+circuit.recordVerificationFailure()
+expect(!circuit.isOpen, "one-off verification failures do not disable the session")
+circuit.recordVerificationFailure()
+expect(circuit.isOpen, "repeated accepted-but-unverified moves open the session circuit")
+circuit.recordVerifiedMove()
+expect(circuit.isOpen, "an open session circuit never silently re-enables itself")
+
 
 // MARK: -
 

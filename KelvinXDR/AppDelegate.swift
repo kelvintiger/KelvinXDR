@@ -44,6 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let osd = OSD()
     private let systemOSD = SystemOSD()
     private let controller = DisplayController()
+    private let spaces = SpaceLayoutManager()
 
     /// The click the volume keys make. Held rather than rebuilt per press — NSSound re-reads
     /// the file otherwise, and this one fires on every notch.
@@ -64,13 +65,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     )
 
     private var shortcuts: Shortcuts!
-    private lazy var settings: SettingsWindowController = {
+    private var settingsController: SettingsWindowController?
+    private var settings: SettingsWindowController {
+        if let settingsController = settingsController { return settingsController }
         let controller = SettingsWindowController()
         controller.onChange = { [weak self] in self?.settingsChanged() }
         controller.isShortcutActive = { [weak self] in self?.shortcuts.isActive($0) ?? false }
         controller.values = { [weak self] in self?.editableValues() ?? [] }
+        controller.spaceProfileCatalog = { [weak self] in
+            self?.spaces.profileCatalog() ?? SpaceProfileCatalog(setups: [])
+        }
+        controller.captureProfile = { [weak self] name, done in
+            self?.spaces.saveProfile(named: name, completion: done)
+        }
+        controller.applyProfile = { [weak self] name, setup in
+            self?.spaces.restoreProfile(named: name, in: setup)
+        }
+        controller.selectProfile = { [weak self] name, setup, done in
+            self?.spaces.selectProfile(name, in: setup, completion: done)
+        }
+        controller.renameProfileMutation = { [weak self] old, new, setup, done in
+            self?.spaces.renameProfile(old, to: new, in: setup, completion: done)
+        }
+        controller.deleteProfileMutation = { [weak self] name, setup, done in
+            self?.spaces.deleteProfile(name, in: setup, completion: done)
+        }
+        controller.layoutMutationsEnabled = { [weak self] in
+            !(self?.spaces.isOperating ?? true)
+        }
+        settingsController = controller
         return controller
-    }()
+    }
 
     private func flag(_ key: String, default value: Bool) -> Bool {
         UserDefaults.standard.object(forKey: key) as? Bool ?? value
@@ -309,6 +334,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 
+        // The initial read-only capability inventory can complete immediately and its
+        // onChange callback rebuilds the menu, so register now and start after all menu
+        // dependencies below are initialized.
+        spaces.onChange = { [weak self] in
+            self?.rebuildMenu()
+            if self?.settingsController?.window?.isVisible == true {
+                self?.settingsController?.reload()
+            }
+        }
+
         mediaKeys = MediaKeys { [weak self] key, screen, modifiers in
             self?.handleMediaKey(key, on: screen, modifiers: modifiers) ?? false
         }
@@ -335,6 +370,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
         applyState()
         refreshDisplays()
+        spaces.start()
 
         // One breadcrumb per launch, so field debugging can first prove the app's logs
         // reach the unified log at all — during the HUD-zombie hunt an empty `log show`
@@ -437,6 +473,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             finishLaunch(on: screen)
             return
         }
+        // Before the gamma comparison below and deliberately unconditional: this feature
+        // compares display UUIDs rather than the CGDirectDisplayIDs `knownDisplays` holds, and
+        // it must see the notifications this one decides to ignore.
+        spaces.screenParametersChanged()
+
         let current = Set(NSScreen.screens.compactMap { $0.displayID })
         // This notification also fires for brightness and colour-profile changes, not only
         // hotplug. Only a genuine change of display set can stale a captured gamma baseline,
@@ -1001,6 +1042,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(check("Show Volume", showVolume, #selector(toggleShowVolume)))
         menu.addItem(check("Smooth Transitions", smooth, #selector(toggleSmooth)))
         menu.addItem(check("Use System HUD", useSystemHUD, #selector(toggleSystemHUD)))
+        menu.addItem(spacesMenu())
 
         if !mediaKeys.isRunning {
             let item = NSMenuItem(title: "Enable Media Keys…", action: #selector(enableMediaKeys), keyEquivalent: "")
@@ -1015,6 +1057,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(check("Launch at Login", SMAppService.mainApp.status == .enabled, #selector(toggleLaunchAtLogin)))
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
+    }
+
+    /// Its own submenu: these actions have nothing to do with brightness, and the main
+    /// menu is already one row per display per control.
+    private func spacesMenu() -> NSMenuItem {
+        let item = NSMenuItem(title: "Space Layout Protection", action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: "Space Layout Protection")
+        // Restore is greyed out until something has been saved, and AppKit only leaves an
+        // explicit isEnabled alone once it has been told to stop enabling items itself.
+        submenu.autoenablesItems = false
+
+        if let status = spaces.capabilityStatusText {
+            let note = NSMenuItem(title: status, action: nil, keyEquivalent: "")
+            note.isEnabled = false
+            submenu.addItem(note)
+        }
+        let automatic = check("Automatically Restore Layouts", spaces.automaticRestoreEnabled,
+                              #selector(toggleAutomaticSpaceRestore))
+        // Always allow turning it off immediately, including while an operation is active.
+        automatic.isEnabled = spaces.automaticRestoreEnabled || spaces.capabilities.canRestore
+        submenu.addItem(automatic)
+        submenu.addItem(.separator())
+
+        let save = NSMenuItem(title: "Save Current Normal-Space Layout",
+                              action: #selector(saveSpaceLayout), keyEquivalent: "")
+        save.target = self
+        save.isEnabled = spaces.canSave
+        submenu.addItem(save)
+
+        let restore = NSMenuItem(title: "Restore Normal-Space Layout",
+                                 action: #selector(restoreSpaceLayout), keyEquivalent: "")
+        restore.target = self
+        restore.isEnabled = spaces.hasSavedLayout && spaces.canRestore
+        submenu.addItem(restore)
+
+        let conversion = NSMenuItem(title: "Convert Fullscreen Apps to Dedicated Desktops…",
+                                    action: #selector(convertFullscreenApps), keyEquivalent: "")
+        conversion.target = self
+        conversion.isEnabled = spaces.canConvert
+        submenu.addItem(conversion)
+        item.submenu = submenu
+        return item
     }
 
     private func check(_ title: String, _ on: Bool, _ action: Selector) -> NSMenuItem {
@@ -1059,6 +1143,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: - Actions
+
+    @objc private func toggleAutomaticSpaceRestore() {
+        spaces.automaticRestoreEnabled.toggle()
+        rebuildMenu()
+    }
+    @objc private func saveSpaceLayout() { spaces.saveCurrentLayout() }
+    @objc private func restoreSpaceLayout() { spaces.restoreCurrentLayout() }
+    @objc private func convertFullscreenApps() { spaces.convertFullscreenApps() }
 
     @objc private func toggleSync() { syncAll.toggle(); rebuildMenu() }
     @objc private func toggleSmooth() { smooth.toggle(); rebuildMenu() }

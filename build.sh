@@ -8,6 +8,12 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Captured before anything else: the icon loop below uses `set -- $spec` to split a spec
+# line, which overwrites the positional parameters. Reading "$1" after that point silently
+# yields "1024", which is how `build.sh run` stopped relaunching the app without anyone
+# noticing — it compared the last icon size against "run".
+CMD="${1:-}"
+
 APP="build/KelvinXDR.app"
 BUNDLE_ID="com.kelvin.KelvinXDR"
 # Plain string, not an array: macOS ships bash 3.2, where expanding an empty array under
@@ -18,7 +24,7 @@ if [ "${STRICT:-}" = "1" ]; then STRICT_FLAGS="-warnings-as-errors"; fi
 # Only the pure logic — everything else needs an XDR panel, an I2C bus or an Accessibility
 # grant. Deliberately narrow rather than mocked: a mock of a private display API would test
 # the mock. See Tests/main.swift.
-if [ "${1:-}" = "test" ]; then
+if [ "$CMD" = "test" ]; then
     mkdir -p build
     # The bridging header + IOKit are for DDC.swift, whose reply parser is pure logic worth
     # checking; the I2C entry points it also declares resolve from the SDK's IOKit stubs.
@@ -29,7 +35,8 @@ if [ "${1:-}" = "test" ]; then
         -framework IOKit \
         -o build/KelvinXDRTests \
         Tests/main.swift KelvinXDR/Detent.swift KelvinXDR/AudioOutput.swift KelvinXDR/Shortcuts.swift KelvinXDR/Settings.swift KelvinXDR/GammaBoost.swift \
-        KelvinXDR/MediaKeys.swift KelvinXDR/PercentField.swift KelvinXDR/OSD.swift KelvinXDR/DDC.swift
+        KelvinXDR/MediaKeys.swift KelvinXDR/PercentField.swift KelvinXDR/OSD.swift KelvinXDR/DDC.swift \
+        KelvinXDR/SpaceSnapshot.swift KelvinXDR/SpacePlanner.swift
     exec build/KelvinXDRTests
 fi
 
@@ -47,7 +54,10 @@ swiftc -O $STRICT_FLAGS \
     KelvinXDR/AppleBrightness.swift KelvinXDR/Shade.swift KelvinXDR/DisplayControl.swift \
     KelvinXDR/AudioOutput.swift KelvinXDR/Detent.swift \
     KelvinXDR/Shortcuts.swift KelvinXDR/Settings.swift \
-    KelvinXDR/SystemOSD.swift KelvinXDR/PercentField.swift
+    KelvinXDR/SystemOSD.swift KelvinXDR/PercentField.swift \
+    KelvinXDR/SpaceSnapshot.swift KelvinXDR/SpacePlanner.swift KelvinXDR/SkyLightSpaces.swift \
+    KelvinXDR/MissionControlDesktopCreator.swift KelvinXDR/WindowAccessibility.swift \
+    KelvinXDR/SpaceLayoutManager.swift
 
 # Start from the repo's Info.plist (LSUIElement) and add the keys Xcode would generate
 cp KelvinXDR/Info.plist "$APP/Contents/Info.plist"
@@ -94,7 +104,23 @@ fi
 
 echo "Built $APP"
 
-if [ "${1:-}" = "run" ]; then
+if [ "$CMD" = "run" ]; then
     killall KelvinXDR 2>/dev/null || true
     open "$APP"
+fi
+
+# Install to /Applications, where the Accessibility grant is anchored.
+#
+# Staged beside the target and swapped in, never rm-then-cp: a copy that fails part way —
+# a full disk will do it — otherwise leaves the machine with no app at all, and the one
+# that just got deleted was the working one.
+if [ "$CMD" = "install" ]; then
+    STAGING="/Applications/.KelvinXDR.staging.app"
+    rm -rf "$STAGING"
+    cp -R "$APP" "$STAGING"
+    killall KelvinXDR 2>/dev/null || true
+    rm -rf /Applications/KelvinXDR.app
+    mv "$STAGING" /Applications/KelvinXDR.app
+    open /Applications/KelvinXDR.app
+    echo "Installed /Applications/KelvinXDR.app"
 fi

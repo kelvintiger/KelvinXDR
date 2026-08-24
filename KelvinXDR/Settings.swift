@@ -106,14 +106,37 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     /// The levels to offer for typing, re-read every time the window opens.
     var values: (() -> [Value])?
 
+    /// Saved Space layouts are immutable view data here. Every mutation routes back through
+    /// SpaceLayoutManager's serialized queue instead of editing profile files from the UI.
+    var spaceProfileCatalog: (() -> SpaceProfileCatalog)?
+    /// Snapshot the screen and keep it under this name, then call back on the main thread.
+    var captureProfile: ((String, @escaping () -> Void) -> Void)?
+    var applyProfile: ((String?, PhysicalTopologyID) -> Void)?
+    var selectProfile: ((String?, PhysicalTopologyID, @escaping () -> Void) -> Void)?
+    var renameProfileMutation: ((String, String, PhysicalTopologyID, @escaping () -> Void) -> Void)?
+    var deleteProfileMutation: ((String, PhysicalTopologyID, @escaping () -> Void) -> Void)?
+    var layoutMutationsEnabled: (() -> Bool)?
+
+    private var setupPopup: NSPopUpButton!
+    private var profileTable: NSTableView!
+    private var profileMutationButtons: [NSButton] = []
+    private var setups: [SpaceProfileCatalog.Setup] = []
+    /// Rows of the profile table. `name` is nil for the auto-saved profile.
+    /// Not private so the test can check what the list renders without showing a window.
+    private(set) var profileRows: [(name: String?, label: String)] = []
+
     private var excluded: [String] = []
     private var excludedTable: NSTableView!
     private var recorders: [ShortcutAction: ShortcutRecorder] = [:]
     private var levelsStack: NSStackView!
+    /// The content itself, inside the scroll view. Not private so the layout test can measure
+    /// it without the scroller in the way.
+    private(set) var contentStack: NSStackView!
 
     convenience init() {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 560),
-                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
+                              styleMask: [.titled, .closable, .resizable],
+                              backing: .buffered, defer: false)
         window.title = "KelvinXDR Settings"
         window.isReleasedWhenClosed = false
         self.init(window: window)
@@ -148,6 +171,130 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             recorder.isActive = isShortcutActive?(action) ?? true
         }
         reloadLevels()
+        reloadSetups()
+        let enabled = layoutMutationsEnabled?() ?? true
+        profileMutationButtons.forEach { $0.isEnabled = enabled }
+    }
+
+    // MARK: - Space profiles
+
+    /// The setup popup, current arrangement first so the common case needs no clicking.
+    private func reloadSetups() {
+        guard let popup = setupPopup else { return }
+        let previous = selectedSetup?.topologyID
+        setups = spaceProfileCatalog?().setups ?? []
+
+        popup.removeAllItems()
+        for setup in setups {
+            popup.addItem(withTitle: setup.description + (setup.isConnected ? " (connected)" : ""))
+        }
+        if let previous = previous,
+           let index = setups.firstIndex(where: { $0.topologyID == previous }) {
+            popup.selectItem(at: index)
+        } else if let index = setups.firstIndex(where: { $0.isConnected }) {
+            popup.selectItem(at: index)
+        }
+        reloadProfiles()
+    }
+
+    private var selectedSetup: SpaceProfileCatalog.Setup? {
+        guard let popup = setupPopup, popup.indexOfSelectedItem >= 0,
+              popup.indexOfSelectedItem < setups.count else { return nil }
+        return setups[popup.indexOfSelectedItem]
+    }
+
+    private func reloadProfiles() {
+        guard let setup = selectedSetup else {
+            profileRows = []
+            profileTable?.reloadData()
+            return
+        }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+
+        var rows: [(String?, String)] = []
+        if let newest = setup.autoSavedAt {
+            rows.append((nil, "Auto-saved — updated "
+                         + formatter.localizedString(for: newest, relativeTo: Date())))
+        } else {
+            rows.append((nil, "Auto-saved — nothing recorded yet"))
+        }
+        for profile in setup.profiles {
+            rows.append((profile.name, "\(profile.name) — \(profile.spaceCount) desktop(s), "
+                         + "\(profile.windowCount) normal window(s)"))
+        }
+        // The selected one is marked rather than merely highlighted: table selection means
+        // "the row you are about to act on", which is a different thing.
+        profileRows = rows.map { (name, label) in
+            (name, (name == setup.selectedName ? "● " : "   ") + label)
+        }
+        profileTable?.reloadData()
+    }
+
+    @objc private func setupChanged() { reloadProfiles() }
+
+    /// One-field prompt. NSAlert rather than a second window: it is one string.
+    private func askForName(_ title: String, _ initial: String) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(string: initial)
+        field.frame = NSRect(x: 0, y: 0, width: 240, height: 24)
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }
+
+    @objc private func saveProfile() {
+        guard let name = askForName("Name this layout", "Standard") else { return }
+        captureProfile?(name) { [weak self] in self?.reloadSetups(); self?.onChange?() }
+    }
+
+    @objc private func useProfile() {
+        guard let setup = selectedSetup else { return }
+        let row = profileTable.selectedRow
+        guard row >= 0, row < profileRows.count else { return }
+        selectProfile?(profileRows[row].name, setup.topologyID) { [weak self] in
+            self?.reloadSetups()
+            self?.onChange?()
+        }
+    }
+
+    @objc private func renameProfile() {
+        guard let setup = selectedSetup else { return }
+        let row = profileTable.selectedRow
+        guard row >= 0, row < profileRows.count, let old = profileRows[row].name else { return }
+        guard let new = askForName("Rename this layout", old), new != old else { return }
+        renameProfileMutation?(old, new, setup.topologyID) { [weak self] in
+            self?.reloadSetups()
+            self?.onChange?()
+        }
+    }
+
+    @objc private func deleteProfile() {
+        guard let setup = selectedSetup else { return }
+        let row = profileTable.selectedRow
+        guard row >= 0, row < profileRows.count, let name = profileRows[row].name else { return }
+        let alert = NSAlert()
+        alert.messageText = "Delete the layout \"\(name)\"?"
+        alert.informativeText = "The arrangement it holds is not recoverable."
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        deleteProfileMutation?(name, setup.topologyID) { [weak self] in
+            self?.reloadSetups()
+            self?.onChange?()
+        }
+    }
+
+    @objc private func restoreProfile() {
+        guard let setup = selectedSetup else { return }
+        let row = profileTable.selectedRow
+        guard row >= 0, row < profileRows.count else { return }
+        applyProfile?(profileRows[row].name, setup.topologyID)
     }
 
     /// Rebuilt rather than updated: displays come and go, and the row count changes with them.
@@ -227,14 +374,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .leading
-        root.spacing = 18
-        root.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        root.spacing = 12
+        root.edgeInsets = NSEdgeInsets(top: 16, left: 20, bottom: 16, right: 20)
         root.translatesAutoresizingMaskIntoConstraints = false
 
         root.addArrangedSubview(label("Levels", 13, .semibold))
         root.addArrangedSubview(paragraph(
-            "Type an exact percentage and press Return; Escape puts the old one back. "
-            + "The built-in display goes to 159% — everything above 100% is the XDR boost."))
+            "Type a percentage and press Return; Escape reverts. Above 100% is the XDR boost."))
 
         // Populated by reloadLevels() every time the window opens, since the display list is
         // not fixed. Empty at build time.
@@ -278,7 +424,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         root.addArrangedSubview(NSBox.separator())
         root.addArrangedSubview(label("HDR trigger corner", 13, .semibold))
         root.addArrangedSubview(paragraph(
-            "Where the 1×1 pixel that turns on HDR sits. A rounded display corner hides it."))
+            "Where the 1×1 pixel that turns on HDR sits."))
 
         let corner = NSPopUpButton(frame: .zero, pullsDown: false)
         // Default first, so the `?? 0` fallback lands on it for an unset or unrecognised pref.
@@ -290,10 +436,59 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         root.addArrangedSubview(corner)
 
         root.addArrangedSubview(NSBox.separator())
+        root.addArrangedSubview(label("Space Layouts", 13, .semibold))
+        root.addArrangedSubview(paragraph(
+            "Layouts stay separate per physical display setup. ● marks the profile restored "
+            + "for that exact setup."))
+
+        setupPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+        setupPopup.target = self
+        setupPopup.action = #selector(setupChanged)
+        setupPopup.translatesAutoresizingMaskIntoConstraints = false
+        setupPopup.widthAnchor.constraint(equalToConstant: Self.contentWidth).isActive = true
+        root.addArrangedSubview(setupPopup)
+
+        profileTable = NSTableView()
+        profileTable.headerView = nil
+        profileTable.rowHeight = 20
+        profileTable.dataSource = self
+        profileTable.delegate = self
+        profileTable.doubleAction = #selector(useProfile)
+        profileTable.target = self
+        let profileColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("profile"))
+        profileColumn.width = 380
+        profileTable.addTableColumn(profileColumn)
+
+        let profileScroll = NSScrollView()
+        profileScroll.documentView = profileTable
+        profileScroll.hasVerticalScroller = true
+        profileScroll.borderType = .bezelBorder
+        profileScroll.translatesAutoresizingMaskIntoConstraints = false
+        profileScroll.heightAnchor.constraint(equalToConstant: 88).isActive = true
+        profileScroll.widthAnchor.constraint(equalToConstant: Self.contentWidth).isActive = true
+        root.addArrangedSubview(profileScroll)
+
+        // Two rows: five buttons do not fit across 400pt without truncating their titles.
+        let saveAs = NSButton(title: "Save Current As…", target: self, action: #selector(saveProfile))
+        let use = NSButton(title: "Use for This Setup", target: self, action: #selector(useProfile))
+        let restoreNow = NSButton(title: "Restore Now", target: self, action: #selector(restoreProfile))
+        let topRow = NSStackView(views: [saveAs, use, restoreNow])
+        topRow.orientation = .horizontal
+        topRow.spacing = 8
+        root.addArrangedSubview(topRow)
+
+        let rename = NSButton(title: "Rename", target: self, action: #selector(renameProfile))
+        let delete = NSButton(title: "Delete", target: self, action: #selector(deleteProfile))
+        let bottomRow = NSStackView(views: [rename, delete])
+        bottomRow.orientation = .horizontal
+        bottomRow.spacing = 8
+        root.addArrangedSubview(bottomRow)
+        profileMutationButtons = [saveAs, use, restoreNow, rename, delete]
+
+        root.addArrangedSubview(NSBox.separator())
         root.addArrangedSubview(label("Pause the boost for these apps", 13, .semibold))
         root.addArrangedSubview(paragraph(
-            "The boost switches off while one of these is the front app. "
-            + "Most setups need none."))
+            "The boost switches off while one of these is frontmost."))
 
         excludedTable = NSTableView()
         excludedTable.headerView = nil
@@ -320,12 +515,31 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         buttons.spacing = 8
         root.addArrangedSubview(buttons)
 
-        window?.contentView = root
+        // Scrolled rather than merely sized to fit. Five sections of content is taller than a
+        // laptop screen, and a window sized to its content simply ran off the bottom, taking
+        // the buttons with it — which is not something the user can scroll to.
+        contentStack = root
+        let outer = NSScrollView()
+        outer.hasVerticalScroller = true
+        outer.autohidesScrollers = true
+        outer.drawsBackground = false
+        outer.borderType = NSBorderType.noBorder
+        outer.documentView = root
+        window?.contentView = outer
+        NSLayoutConstraint.activate([
+            root.topAnchor.constraint(equalTo: outer.contentView.topAnchor),
+            root.leadingAnchor.constraint(equalTo: outer.contentView.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: outer.contentView.trailingAnchor),
+        ])
+
         // The contentRect passed to NSWindow is a guess; the stack knows the real height once
-        // the wrapping labels have broken. Without this the window keeps its initial 560pt and
-        // clips the buttons off the bottom.
+        // the wrapping labels have broken.
         root.layoutSubtreeIfNeeded()
-        window?.setContentSize(root.fittingSize)
+        let fitting = root.fittingSize
+        let ceiling = (window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 900
+        window?.setContentSize(NSSize(width: fitting.width,
+                                      height: min(fitting.height, ceiling - 60)))
+        window?.minSize = NSSize(width: fitting.width, height: 320)
     }
 
     // MARK: - Actions
@@ -392,10 +606,20 @@ extension SettingsWindowController: NSTextFieldDelegate {
 }
 
 extension SettingsWindowController: NSTableViewDataSource, NSTableViewDelegate {
-    func numberOfRows(in tableView: NSTableView) -> Int { excluded.count }
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        tableView === profileTable ? profileRows.count : excluded.count
+    }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?,
                    row: Int) -> NSView? {
+        if tableView === profileTable {
+            guard row < profileRows.count else { return nil }
+            let field = NSTextField(labelWithString: profileRows[row].label)
+            field.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+            field.lineBreakMode = .byTruncatingTail
+            return field
+        }
+        guard row < excluded.count else { return nil }
         let field = NSTextField(labelWithString: excluded[row])
         field.font = .systemFont(ofSize: 11)
         return field
