@@ -258,6 +258,17 @@ if let content = settings.contentStack {
     func button(_ title: String) -> NSButton? { buttons.first { $0.title == title } }
     expect(labels.contains("Space Layout Protection — Experimental"),
            "Space protection is visibly marked Experimental in Settings")
+    let experimentalHeadingIndex = content.arrangedSubviews.firstIndex {
+        ($0 as? NSTextField)?.stringValue == "Space Layout Protection — Experimental"
+    }
+    let appPauseButtonsIndex = content.arrangedSubviews.firstIndex { view in
+        descendants(view).contains {
+            ($0 as? NSButton)?.title == "Add App…"
+        }
+    }
+    expect(experimentalHeadingIndex != nil && appPauseButtonsIndex != nil
+           && experimentalHeadingIndex! > appPauseButtonsIndex!,
+           "the complete Experimental section is below the app-pause controls")
     expect(button("Enable Experimental Space Writes")?.state == .off,
            "the Settings write opt-in renders off by default")
     expect(button("Automatically Restore Layouts")?.isEnabled == false,

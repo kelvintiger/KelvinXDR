@@ -487,6 +487,36 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         root.addArrangedSubview(corner)
 
         root.addArrangedSubview(NSBox.separator())
+        root.addArrangedSubview(label("Pause the boost for these apps", 13, .semibold))
+        root.addArrangedSubview(paragraph(
+            "The boost switches off while one of these is frontmost."))
+
+        excludedTable = NSTableView()
+        excludedTable.headerView = nil
+        excludedTable.rowHeight = 20
+        excludedTable.dataSource = self
+        excludedTable.delegate = self
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("bundle"))
+        column.width = 380
+        excludedTable.addTableColumn(column)
+
+        let scroll = NSScrollView()
+        scroll.documentView = excludedTable
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.heightAnchor.constraint(equalToConstant: 90).isActive = true
+        scroll.widthAnchor.constraint(equalToConstant: Self.contentWidth).isActive = true
+        root.addArrangedSubview(scroll)
+
+        let add = NSButton(title: "Add App…", target: self, action: #selector(addExcluded))
+        let remove = NSButton(title: "Remove", target: self, action: #selector(removeExcluded))
+        let buttons = NSStackView(views: [add, remove])
+        buttons.orientation = .horizontal
+        buttons.spacing = 8
+        root.addArrangedSubview(buttons)
+
+        root.addArrangedSubview(NSBox.separator())
         root.addArrangedSubview(label("Space Layout Protection — Experimental", 13, .semibold,
                                       .systemOrange))
         root.addArrangedSubview(paragraph(
@@ -560,36 +590,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             title: "Convert Fullscreen Apps to Dedicated Desktops…", target: self,
             action: #selector(convertFullscreenAppsNow))
         root.addArrangedSubview(convertFullscreenButton)
-
-        root.addArrangedSubview(NSBox.separator())
-        root.addArrangedSubview(label("Pause the boost for these apps", 13, .semibold))
-        root.addArrangedSubview(paragraph(
-            "The boost switches off while one of these is frontmost."))
-
-        excludedTable = NSTableView()
-        excludedTable.headerView = nil
-        excludedTable.rowHeight = 20
-        excludedTable.dataSource = self
-        excludedTable.delegate = self
-        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("bundle"))
-        column.width = 380
-        excludedTable.addTableColumn(column)
-
-        let scroll = NSScrollView()
-        scroll.documentView = excludedTable
-        scroll.hasVerticalScroller = true
-        scroll.borderType = .bezelBorder
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.heightAnchor.constraint(equalToConstant: 90).isActive = true
-        scroll.widthAnchor.constraint(equalToConstant: Self.contentWidth).isActive = true
-        root.addArrangedSubview(scroll)
-
-        let add = NSButton(title: "Add App…", target: self, action: #selector(addExcluded))
-        let remove = NSButton(title: "Remove", target: self, action: #selector(removeExcluded))
-        let buttons = NSStackView(views: [add, remove])
-        buttons.orientation = .horizontal
-        buttons.spacing = 8
-        root.addArrangedSubview(buttons)
 
         // Scrolled rather than merely sized to fit. Five sections of content is taller than a
         // laptop screen, and a window sized to its content simply ran off the bottom, taking
