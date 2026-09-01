@@ -51,6 +51,10 @@ real backlight. At 100% the backlight pins at maximum and a 1x1 pixel EDR surfac
 display into HDR mode, so the gamma transfer table can spend the headroom that opens up, to
 about 1.59x above normal SDR white. Crossing 100% is what engages XDR; there is no toggle.
 
+Using XDR brightness above 100% consumes more power, generates more heat, and may contribute
+to normal backlight aging over time. macOS may automatically limit brightness if the display
+gets too warm.
+
 **External monitors over DDC/CI.** Real hardware brightness, contrast, volume and mute, the
 same settings the monitor's own buttons change, not a software dim.
 
