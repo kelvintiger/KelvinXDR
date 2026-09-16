@@ -333,6 +333,18 @@ expect(MediaKeys.adjustment(for: [.command, .option]) == .openSettings,
        "⌘⌥ still opens settings — ⌥ is what counts")
 expect(MediaKeys.adjustment(for: [.capsLock]) == .coarse, "capsLock is not a modifier here")
 
+// A remapper (Logi Options+ here) delivers a brightness key as a plain F14/F15 keypress
+// instead of an NX_SYSDEFINED media key, so those two codes have to mean brightness. Every
+// other key code must fall through untouched — claiming one would swallow real typing.
+section("MediaKeys — legacy F14/F15 brightness keys")
+expect(MediaKeys.key(forFunctionKeyCode: 107) == .brightnessDown, "F14 -> brightness down")
+expect(MediaKeys.key(forFunctionKeyCode: 113) == .brightnessUp, "F15 -> brightness up")
+expect(MediaKeys.key(forFunctionKeyCode: 0) == nil, "A is not a brightness key")
+expect(MediaKeys.key(forFunctionKeyCode: 49) == nil, "space is not a brightness key")
+expect(MediaKeys.key(forFunctionKeyCode: 96) == nil, "F5 is not a brightness key")
+expect(MediaKeys.key(forFunctionKeyCode: 2) == nil,
+       "2 is NX_KEYTYPE_BRIGHTNESS_UP but a 'D' key code — the two namespaces must not mix")
+
 // MARK: - Typed percentages
 
 // Clamping rather than rejecting is the point: typing 500 into a control that stops at 159

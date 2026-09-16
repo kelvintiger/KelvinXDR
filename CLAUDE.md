@@ -185,6 +185,19 @@ A menu bar app is awkward to inspect from a shell. These all work without a huma
   disk did it here — leaves the machine with no app at all, and the one just deleted was the
   working one. `./build.sh install` copies to `/Applications/.KelvinXDR.staging.app` first and
   `mv`s it into place, which is atomic and cannot strand you.
+- **Brightness keys arrive in two dialects, at two different tap levels.** Measured here with
+  a listen-only tap at both: the built-in keyboard sends `NX_SYSDEFINED` subtype 8 with
+  `NX_KEYTYPE_BRIGHTNESS_UP`/`_DOWN` (2/3) and it is visible at `.cghidEventTap`. Logi
+  Options+ sends its "Brightness down" as a plain **F14** keypress (F15 for up, key codes 107
+  and 113) and posts it at `.cgSessionEventTap`, downstream of every HID tap — so a HID tap
+  never sees it, whatever mask it uses. `MediaKeys` therefore runs two taps with disjoint
+  masks: system-defined at HID, key events at session. Disjoint is what stops one press being
+  counted twice; never widen either mask to cover both.
+- **Synthesising the remapped key is the only headless way to test it.** `CGEvent` for key
+  code 107 posted with `.cgSessionEventTap` is byte-for-byte what Options+ delivers, so a
+  throwaway tool can press it and then read the monitor's DDC register to prove the whole
+  path. Four presses moved one VA3209-UHD 100 -> 71 while the other stayed at 100, which
+  verifies the cursor routing at the same time.
 - **Window titles:** `kCGWindowName` needs Screen Recording, while `kAXTitle` and `AXDocument`
   use Accessibility through `_AXUIElementGetWindow`. KelvinXDR never requests Screen Recording;
   if it is already granted, the CG title is an optional quality improvement. A shell probe may
