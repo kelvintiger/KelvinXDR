@@ -64,6 +64,11 @@ audio output; otherwise they drive the device you can hear. Option opens the mat
 Settings pane, Shift inverts the feedback click, and Option+Shift takes quarter steps, the
 same as the stock keys.
 
+Third-party keyboards work too. A remapper such as Logi Options+ sends its brightness action
+as a plain F14 or F15 keypress — the brightness keys of pre-2007 Apple keyboards — rather
+than as a media key, and injects it downstream of where media keys arrive, so both dialects
+are listened for at both levels. F14 and F15 are the only key codes ever taken.
+
 **A compact HUD, or the stock one.** Level changes show a small indicator on the display they
 applied to. It hangs under the notch, the track can be dragged like the iOS volume bar, and
 it never eats clicks when there is nothing to drag. Prefer the system bezel? Toggle "Use
