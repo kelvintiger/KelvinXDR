@@ -19,4 +19,8 @@ app.delegate = delegate
 // Menu bar only, no Dock icon
 app.setActivationPolicy(.accessory)
 
+// Never drawn — an accessory app has no menu bar — but it is where AppKit resolves ⌘W, ⌘Q
+// and the editing shortcuts for the Settings window. See MainMenu.swift.
+app.mainMenu = MainMenu.make()
+
 app.run()

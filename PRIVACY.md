@@ -1,6 +1,6 @@
 # Privacy Policy
 
-Last updated: 11 August 2026
+Last updated: 4 October 2026
 
 ## The app collects and transmits nothing
 
@@ -24,6 +24,36 @@ domain in your own home directory:
 
 They are readable and writable by you, they are not synced anywhere by the app, and they
 are removed when you delete that file. The app never uploads them.
+
+## Saved Space layouts stay on your Mac too
+
+Space Layout Protection is experimental and does nothing unless you use it. When you do, it
+keeps its layout profiles as JSON files in a second place:
+
+```
+~/Library/Application Support/KelvinXDR/SpaceLayouts/
+```
+
+A profile describes the windows that were on each desktop when it was saved: the owning
+app's name and bundle identifier, the window's title, the document the app reports for it
+(usually the path or URL of the open file) where there is one, the window's position and
+size, and the process and window numbers macOS had assigned at the time. It also holds the
+name and identifier of each display, and the file is named after the display identifiers.
+Window titles and document paths can say a lot about what you were working on, so treat
+these files accordingly.
+
+Nothing is written there on the app's own initiative. A file is created or changed only when
+you save a named layout in Settings, when you confirm **Convert Fullscreen Apps to Dedicated
+Desktops** (which records the arrangement it ends with), or when you select, rename or
+delete a layout you already saved. Restoring a layout, automatic restoration included, only
+reads them.
+
+Like the preferences, these files are never uploaded or synced by the app. To delete them,
+remove the folder:
+
+```bash
+rm -rf ~/Library/Application\ Support/KelvinXDR
+```
 
 ## No analytics, no telemetry
 

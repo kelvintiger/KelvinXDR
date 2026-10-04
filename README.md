@@ -7,6 +7,12 @@ hardware brightness, contrast and volume for external monitors over DDC/CI.
 
 Built for a MacBook Pro 16" (M1 Pro, Liquid Retina XDR) driving two external displays.
 
+Developed and tested on macOS Sequoia 15.7, and only there. macOS Tahoe 26 and macOS 27 are
+untested for the whole app, not just Space Layout Protection. One known soft spot: "Use
+System HUD" drives the private `OSDUIHelper` service, which may show nothing at all on a
+newer macOS. If level changes stop showing an indicator, turn that toggle off and the
+built-in HUD comes back.
+
 Website: <https://kelvinct.com/KelvinXDR/>
 
 KelvinXDR started as an experiment on top of BrightXDR and outgrew it. It is not a fork or
@@ -25,17 +31,20 @@ just tells you they are installed):
 xcode-select --install
 ```
 
+Quit MonitorControl, Lunar, BetterDisplay and BrightIntosh first if any of them is running.
+Two tools doing this job fight over the media keys, the DDC bus and the gamma table, and
+neither one wins.
+
 Then paste this, one block, start to finish:
 
 ```bash
 git clone https://github.com/kelvintiger/KelvinXDR.git
 cd KelvinXDR
-./build.sh
-cp -R build/KelvinXDR.app /Applications/
-open /Applications/KelvinXDR.app
+./build.sh install
 ```
 
-A circled sun appears in the menu bar. Two optional follow-ups:
+`./build.sh install` builds the app, puts it in `/Applications` and launches it. A circled
+sun appears in the menu bar. Two optional follow-ups:
 
 - **Media keys.** Click "Enable Media Keys" in the menu and grant Accessibility when macOS
   asks. Without the grant, the brightness and volume keys keep their stock behaviour;
@@ -212,22 +221,22 @@ moves a test window automatically:
 No Xcode required; the Command Line Tools are enough.
 
 ```bash
-./build.sh          # build
-./build.sh run      # build and relaunch
+./build.sh          # build into build/KelvinXDR.app
+./build.sh run      # build and relaunch from build/
+./build.sh install  # build, install to /Applications and launch
 ./build.sh test     # hardware-free logic checks
 ```
+
+`install` is the one to use day to day. It copies the fresh build to a staging path inside
+`/Applications`, quits the running copy, swaps the new one into place and launches it. The
+copy finishes before the old app is touched, so one that fails part-way (a full disk, say)
+leaves the working install where it was.
 
 ### App icon
 
 `build.sh` looks for `KelvinXDR/AppIcon.png` and generates the `.icns` from it, masked to
 Apple's rounded-square icon grid. Replace it with any square PNG to use your own; without
 one, the app falls back to the default icon.
-
-Install with:
-
-```bash
-cp -R build/KelvinXDR.app /Applications/
-```
 
 ### Signing
 
@@ -274,7 +283,10 @@ killall KelvinXDR
 
 Apple Silicon Mac with an XDR display for the brightness boost. DDC control works with any
 external monitor that implements it, though docks, HDMI extenders and matrix switchers
-often drop the I2C channel, in which case the gamma fallback takes over.
+often drop the I2C channel. A display with neither DDC nor Apple's native brightness control
+is dimmed by a black shade overlay instead: it darkens the picture, but it is not hardware
+brightness and cannot go above the monitor's own setting. Two monitors of the same model
+that report no serial number, or the same one, cannot be told apart, so neither gets DDC.
 
 The boost applies to the **built-in** panel only. On a Mac with no built-in display, the
 slider is a plain 0-100% control even if an attached external is XDR-capable: the 1x1 EDR

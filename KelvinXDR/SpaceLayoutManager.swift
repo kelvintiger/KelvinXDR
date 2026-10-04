@@ -147,9 +147,27 @@ final class SpaceLayoutManager {
 
     var currentTopologyID: PhysicalTopologyID { topologyGate.fingerprint }
 
+    /// Launch does only the public-API half: the CoreGraphics fingerprint and the debouncer.
+    ///
+    /// The feature is default-off and Settings-only, so resolving SkyLight symbols and reading
+    /// its inventory at every launch put a private API in the startup path of people who
+    /// will never open it — and a private-API change on a newer macOS should not be able to
+    /// reach them. With the gate off, that half waits for the Settings window.
     func start() {
         topologyGate = TopologyGate(fingerprint: Self.currentTopology())
         debouncer = TopologyDebouncer(enabled: automaticRestoreEnabled)
+        if experimentalWritesEnabled { probeRuntime() }
+    }
+
+    private var probedRuntime = false
+
+    /// The private-API half of startup: the capability log and the first SkyLight inventory,
+    /// which is what tells Settings whether Spaces are per-display or the shared Main row.
+    /// Once per session, on the main thread — at launch when the gate is already on,
+    /// otherwise the first time the Settings window opens.
+    func probeRuntime() {
+        guard !probedRuntime else { return }
+        probedRuntime = true
         let caps = capabilities
         if !caps.canInventory { log("inventory unavailable: \(caps.unavailableReasons.joined(separator: "; "))") }
         queue.async { [weak self] in

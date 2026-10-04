@@ -391,6 +391,108 @@ expect(DDC.parseReply(vcpReply(opcode: 0x10, maxHi: 1, maxLo: 0, curHi: 0, curLo
                       command: 0x10)! == (255, 256),
        "16-bit fields assemble high byte first")
 
+// MARK: - DDC screen-to-service matching
+
+// Binding used to be "EDID serial, non-zero" and nothing else, so every monitor that reports
+// serial 0 — a great many do — never got DDC at all. The matcher now falls back to product
+// name and then to "the only one left", and the property worth pinning is the one that makes
+// that safe: it never chooses between candidates it cannot tell apart, because a wrong bind
+// means a slider that drives the other monitor.
+section("DDC — which service drives which screen")
+func binds(_ screens: [(Int64, String)], _ services: [(Int64, String)],
+           _ expected: [Int?], _ why: String) {
+    let got = DDC.match(screens: screens.map { (serial: $0.0, name: $0.1) },
+                        services: services.map { (serial: $0.0, product: $0.1) })
+    expect(got == expected, "\(why) (got \(got))")
+}
+binds([(111, "LG Ultra HD (1)"), (222, "LG Ultra HD (2)")],
+      [(222, "LG Ultra HD"), (111, "LG Ultra HD")], [1, 0],
+      "unique serials bind exactly, whatever order the registry lists them in")
+binds([(0, "DELL U2720Q")], [(0, "")], [0],
+      "serial 0 and no product name: one external, one service, they belong together")
+binds([(0, "DELL U2720Q"), (0, "BenQ PD3220U")],
+      [(0, "BenQ PD3220U"), (0, "DELL U2720Q")], [1, 0],
+      "serial 0 on two different models binds by product name")
+binds([(0, "LG Ultra HD (1)"), (0, "LG Ultra HD (2)")],
+      [(0, "LG Ultra HD"), (0, "LG Ultra HD")], [nil, nil],
+      "two identical monitors with serial 0 are indistinguishable: neither binds")
+binds([(16843009, "LG Ultra HD (1)"), (16843009, "LG Ultra HD (2)")],
+      [(16843009, "LG Ultra HD"), (16843009, "LG Ultra HD")], [nil, nil],
+      "a serial shared by two units of one model identifies neither")
+binds([(16843009, "DELL U2720Q"), (16843009, "BenQ PD3220U")],
+      [(16843009, "BenQ PD3220U"), (16843009, "DELL U2720Q")], [1, 0],
+      "a duplicated serial on different models falls through to the name")
+binds([(111, "LG Ultra HD"), (0, "Generic PnP")], [(0, "HDMI"), (111, "LG Ultra HD")], [1, 0],
+      "the leftover pair binds once the serial match has claimed its own")
+binds([(0, "Sidecar Display"), (0, "DELL U2720Q")], [(0, "DELL U2720Q")], [nil, 0],
+      "a screen with no service of its own stays unbound")
+binds([(0, "Left"), (0, "Right")], [(0, "Unnamed")], [nil, nil],
+      "one service and two screens it could belong to: no guess")
+binds([(0, "DELL U2720Q")], [], [nil], "no services, no bind")
+
+// MARK: - Combined brightness scale
+
+// `brightness` is one 0...1 value whose bottom `softwareFraction` is software dimming; the
+// DDC register is only the part above it. Seeding the model with the raw register fraction
+// put it low by f * (1 - hardware) — with the monitor at 20/100 the model said 0.20, the next
+// detent up was 0.25, and split() wrote (0.25 - 0.15) / 0.85 = 12. Brightness-up dimmed.
+section("ManagedDisplay — a register value is not a brightness value")
+// .appleNative stands in for DDC, whose case needs a live IOAVService. The arithmetic only
+// cares that there is hardware at all; nothing here drives it.
+func scale(_ fraction: Double) -> ManagedDisplay {
+    ManagedDisplay(id: 0, name: "Test", isBuiltIn: false, hardware: .appleNative,
+                   softwareFraction: fraction)
+}
+for fraction in [0, 0.15, 0.5] {
+    let display = scale(fraction)
+    let drift = [0, 0.01, 0.2, 0.5, 1].map { hw in
+        abs(display.split(display.combined(hardware: hw)).hardware - hw)
+    }.max() ?? 1
+    expect(drift < 1e-9, "software fraction \(fraction): combined() then split() returns the register")
+}
+let monitor = scale(0.15)
+let seeded = monitor.combined(hardware: 20.0 / 100.0)
+expect(abs(seeded - 0.32) < 1e-9, "register 20/100 seeds the model at 32%, not 20%")
+expect(monitor.split(seeded).software == 1, "…with the software layer fully clear")
+let pressedUp = Detent.next(from: Float(seeded), up: true, ceiling: 1, fine: false)
+expect(monitor.split(Double(pressedUp)).hardware > 0.20,
+       "brightness-up from register 20/100 raises the register")
+let pressedDown = Detent.next(from: Float(seeded), up: false, ceiling: 1, fine: false)
+expect(monitor.split(Double(pressedDown)).hardware < 0.20, "and brightness-down lowers it")
+let rawUp = Detent.next(from: 0.20, up: true, ceiling: 1, fine: false)
+expect(monitor.split(Double(rawUp)).hardware < 0.20,
+       "the raw register fraction is the seed that made brightness-up dim — never seed with it")
+expect(monitor.combined(hardware: 0) == 0.15 && monitor.combined(hardware: 1) == 1,
+       "the hardware range maps onto softwareFraction...1")
+
+// MARK: - Main menu
+
+// An LSUIElement app with no nib has no main menu, and key equivalents resolve against the
+// main menu whether or not it is ever drawn — so ⌘W, ⌘Q and the editing shortcuts were dead
+// in the Settings window and the layout-name prompt.
+section("Main menu — the shortcuts a menu-bar app does not get for free")
+let mainMenu = MainMenu.make()
+let mainMenuItems = mainMenu.items.compactMap { $0.submenu }.flatMap { $0.items }
+func shortcut(_ key: String, _ modifiers: NSEvent.ModifierFlags = .command,
+              sends action: String, _ why: String) {
+    let item = mainMenuItems.first {
+        $0.keyEquivalent == key && $0.keyEquivalentModifierMask == modifiers
+    }
+    expect(item?.action == NSSelectorFromString(action), "\(why) sends \(action)")
+}
+shortcut("q", sends: "terminate:", "⌘Q")
+shortcut("w", sends: "performClose:", "⌘W")
+shortcut("z", sends: "undo:", "⌘Z")
+shortcut("z", [.command, .shift], sends: "redo:", "⇧⌘Z")
+shortcut("x", sends: "cut:", "⌘X")
+shortcut("c", sends: "copy:", "⌘C")
+shortcut("v", sends: "paste:", "⌘V")
+shortcut("a", sends: "selectAll:", "⌘A")
+expect(mainMenuItems.allSatisfy { $0.target == nil },
+       "every item is nil-targeted, so it reaches whichever window and field has focus")
+expect(mainMenu.items.first?.submenu?.items.contains { $0.keyEquivalent == "q" } == true,
+       "Quit sits in the first submenu, which AppKit treats as the application menu")
+
 // MARK: - System bezel chiclets
 
 // The system HUD draws a fixed strip, so the unified 0...159% scale has to map onto it. Keeping
