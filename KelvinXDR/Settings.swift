@@ -5,25 +5,41 @@
 //  The window owns editable lists, recorded shortcuts, and the Settings-only Experimental
 //  Space Layout Protection surface. The menu bar stays focused on everyday display controls.
 //
+//  Three toolbar tabs — General, Shortcuts, Experimental — which is the settings-window
+//  convention on macOS and what keeps it shorter than the screen: as one column it was 1170pt
+//  tall, more than a 16" MacBook shows.
+//
 //  Built in code rather than a xib — build.sh is a bare swiftc call, and a nib would need a
 //  resource pipeline for one window.
 //
 
 import Cocoa
 
-/// Captures the next key combination pressed while it has focus.
+/// Captures the next key combination pressed after it is clicked.
 final class ShortcutRecorder: NSView {
     var onChange: ((Shortcut?) -> Void)?
     var shortcut: Shortcut? { didSet { needsDisplay = true } }
     /// Shown struck-through when another app already owns the combination.
     var isActive = true { didSet { needsDisplay = true } }
 
-    private var recording = false { didSet { needsDisplay = true } }
+    /// Not private so the test can check that focus alone does not arm it.
+    private(set) var recording = false { didSet { needsDisplay = true } }
 
     override var acceptsFirstResponder: Bool { true }
-    override func becomeFirstResponder() -> Bool { recording = true; return true }
     override func resignFirstResponder() -> Bool { recording = false; return true }
-    override func mouseDown(with event: NSEvent) { window?.makeFirstResponder(self) }
+
+    /// A click arms it; keyboard focus does not. Recording on focus trapped anyone tabbing
+    /// through the window: Tab carries no modifier, so the recorder beeped and kept the focus.
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        recording = true
+    }
+
+    // Focus without recording has to show somewhere, or Tab appears to lose its place.
+    override var focusRingMaskBounds: NSRect { bounds }
+    override func drawFocusRingMask() {
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 5, yRadius: 5).fill()
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         let rounded = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 5, yRadius: 5)
@@ -81,7 +97,7 @@ final class ShortcutRecorder: NSView {
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         // While recording, swallow combinations AppKit would otherwise route to the menu —
-        // otherwise ⌘Q would quit rather than being recorded.
+        // otherwise ⌘W would close the window rather than being recorded.
         guard recording else { return false }
         keyDown(with: event)
         return true
@@ -143,13 +159,15 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private var excludedTable: NSTableView!
     private var recorders: [ShortcutAction: ShortcutRecorder] = [:]
     private var levelsStack: NSStackView!
-    /// The content itself, inside the scroll view. Not private so the layout test can measure
-    /// it without the scroller in the way.
-    private(set) var contentStack: NSStackView!
+    private let tabs = NSTabViewController()
+    /// Each tab's content, in tab order. Not private so the layout test can measure the
+    /// panes without their scroll views in the way.
+    private(set) var panes: [NSStackView] = []
 
     convenience init() {
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 560),
-                              styleMask: [.titled, .closable, .resizable],
+        // Not resizable: every pane is sized to its content, as settings windows are.
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 400),
+                              styleMask: [.titled, .closable],
                               backing: .buffered, defer: false)
         window.title = "KelvinXDR Settings"
         window.isReleasedWhenClosed = false
@@ -163,15 +181,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         // LSUIElement apps are not in the Dock and do not activate on their own, so without
         // this the window opens behind whatever you were using.
         NSApp.activate(ignoringOtherApps: true)
-        window?.center()
+        // Only when it is opening. Settings… while it is already up just brings it forward,
+        // and re-centring then would yank a window the user had put somewhere.
+        if window?.isVisible != true { window?.center() }
         showWindow(nil)
     }
 
     /// Disarm any recorder still waiting for a keypress.
     ///
-    /// Closing the window leaves the recorder as first responder, and it stays that way when
-    /// the window is reopened — so the next ⌘W or ⌘Q would be silently captured and registered
-    /// as a global hotkey rather than closing or quitting.
+    /// Closing the window leaves an armed recorder as first responder, still armed when the
+    /// window is reopened — so the next ⌘W would be silently captured and registered as a
+    /// global hotkey rather than closing the window. A level still being typed is committed
+    /// by the same call, since this is editing ending like any other.
     func windowWillClose(_ notification: Notification) {
         window?.makeFirstResponder(nil)
     }
@@ -233,8 +254,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             rows.append((nil, "Auto-saved — nothing recorded yet"))
         }
         for profile in setup.profiles {
-            rows.append((profile.name, "\(profile.name) — \(profile.spaceCount) desktop(s), "
-                         + "\(profile.windowCount) normal window(s)"))
+            rows.append((profile.name, "\(profile.name) — "
+                         + Self.counted(profile.spaceCount, "desktop") + ", "
+                         + Self.counted(profile.windowCount, "window")))
         }
         // The selected one is marked rather than merely highlighted: table selection means
         // "the row you are about to act on", which is a different thing.
@@ -242,6 +264,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             (name, (name == setup.selectedName ? "● " : "   ") + label)
         }
         profileTable?.reloadData()
+    }
+
+    /// "1 desktop", "6 desktops".
+    static func counted(_ count: Int, _ noun: String) -> String {
+        "\(count) \(noun)\(count == 1 ? "" : "s")"
     }
 
     @objc private func setupChanged() { reloadProfiles() }
@@ -331,6 +358,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                 ? "Experimental Space writes are enabled; outcomes remain unverified."
                 : "Experimental Space writes are disabled."
         }
+        // Here rather than only in reload(): the status line wraps to a different number of
+        // lines as the toggles change it, and reload() runs this last anyway.
+        sizePanes()
     }
 
     @objc private func experimentalWritesChanged(_ sender: NSButton) {
@@ -351,6 +381,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     /// Rebuilt rather than updated: displays come and go, and the row count changes with them.
     private func reloadLevels() {
         guard let levelsStack = levelsStack else { return }
+        // A rebuild is not the user leaving the field. Taking a field out mid-edit ends its
+        // editing, which commits — and a reload can arrive from a finished Space operation
+        // while a "1" on its way to "100" is sitting there, to be applied as 1%.
+        for view in levelsStack.arrangedSubviews.flatMap(\.subviews) {
+            (view as? NSControl)?.abortEditing()
+        }
         for view in levelsStack.arrangedSubviews { view.removeFromSuperview() }
 
         let entries = values?() ?? []
@@ -360,14 +396,22 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             return
         }
 
-        let grid = NSGridView(numberOfColumns: 2, rows: 0)
+        let grid = NSGridView(numberOfColumns: 3, rows: 0)
         grid.rowSpacing = 6
-        grid.columnSpacing = 12
+        grid.rowAlignment = .firstBaseline
+        // Tight between the field and its unit, the usual gap between the name and the field.
+        grid.columnSpacing = 4
+        grid.column(at: 0).trailingPadding = 8
+        grid.translatesAutoresizingMaskIntoConstraints = false
+        grid.widthAnchor.constraint(equalToConstant: Self.contentWidth).isActive = true
         for entry in entries {
+            // The name takes whatever the field and its unit leave: it stretches so the
+            // fields line up on the trailing edge, and a long one truncates instead of
+            // widening the window.
             let name = label(entry.title, 12, .regular)
             name.lineBreakMode = .byTruncatingTail
-            name.translatesAutoresizingMaskIntoConstraints = false
-            name.widthAnchor.constraint(equalToConstant: Self.contentWidth - 96).isActive = true
+            name.setContentHuggingPriority(.init(1), for: .horizontal)
+            name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
             let field = PercentField(string: Percent.text(entry.fraction))
             field.maxValue = entry.maxFraction
@@ -382,7 +426,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             field.translatesAutoresizingMaskIntoConstraints = false
             field.widthAnchor.constraint(equalToConstant: 56).isActive = true
 
-            grid.addRow(with: [name, field])
+            grid.addRow(with: [name, field, label("%", 11, .regular, .secondaryLabelColor)])
         }
         levelsStack.addArrangedSubview(grid)
     }
@@ -421,17 +465,79 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         return field
     }
 
-    private func buildContent() {
-        let root = NSStackView()
-        root.orientation = .vertical
-        root.alignment = .leading
-        root.spacing = 12
-        root.edgeInsets = NSEdgeInsets(top: 16, left: 20, bottom: 16, right: 20)
-        root.translatesAutoresizingMaskIntoConstraints = false
+    /// One toolbar tab, returning the stack its content goes into.
+    private func pane(_ title: String, symbol: String) -> NSStackView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.edgeInsets = NSEdgeInsets(top: 16, left: 20, bottom: 16, right: 20)
+        stack.translatesAutoresizingMaskIntoConstraints = false
 
-        root.addArrangedSubview(label("Levels", 13, .semibold))
-        root.addArrangedSubview(paragraph(
-            "Type a percentage and press Return; Escape reverts. Above 100% is the XDR boost."))
+        // sizePanes() makes the tab exactly as tall as this stack, so nothing scrolls. The
+        // scroll view is for the one case that cannot fit: enough displays in Levels to be
+        // taller than the screen, where a window sized to its content ran off the bottom and
+        // took the last controls with it — which is not something the user can scroll to.
+        let scroll = NSScrollView()
+        scroll.contentView = TopClipView()
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        scroll.borderType = .noBorder
+        scroll.documentView = stack
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            // Stated outright. NSStackView holds its trailing inset only at hugging priority,
+            // so a pane with nothing stretchy in it measured 20pt narrower than the others
+            // and the window changed width between tabs.
+            stack.widthAnchor.constraint(equalToConstant: Self.contentWidth + 40),
+        ])
+
+        let controller = NSViewController()
+        controller.view = scroll
+        let item = NSTabViewItem(viewController: controller)
+        item.label = title
+        item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+        tabs.addTabViewItem(item)
+        panes.append(stack)
+        return stack
+    }
+
+    /// Size every tab to its own content; the window follows the selected one.
+    ///
+    /// The stack knows its real height only once the wrapping labels have broken, and Levels
+    /// changes with the display list, so this runs on every reload rather than once.
+    private func sizePanes() {
+        guard let window = window else { return }
+        // The title bar and toolbar share the screen with the content.
+        let chrome = window.frame.height - window.contentLayoutRect.height
+        let ceiling = ((window.screen ?? NSScreen.main)?.visibleFrame.height ?? 900) - chrome
+        for (item, stack) in zip(tabs.tabViewItems, panes) {
+            stack.layoutSubtreeIfNeeded()
+            let fitting = stack.fittingSize
+            item.viewController?.preferredContentSize =
+                NSSize(width: fitting.width, height: min(fitting.height, ceiling))
+        }
+        // NSTabViewController resizes the window to the selected tab by itself, but a turn of
+        // the run loop later — too late for show(), which centres the window right after this.
+        let selected = tabs.selectedTabViewItemIndex
+        if tabs.tabViewItems.indices.contains(selected),
+           let size = tabs.tabViewItems[selected].viewController?.preferredContentSize {
+            window.setContentSize(size)
+        }
+    }
+
+    private func buildContent() {
+        tabs.tabStyle = .toolbar
+
+        // MARK: General
+
+        let general = pane("General", symbol: "gearshape")
+        general.addArrangedSubview(label("Levels", 13, .semibold))
+        general.addArrangedSubview(paragraph(
+            "Type a percentage; it applies when you press Return or leave the field, and "
+            + "Escape reverts. Above 100% is the XDR boost."))
 
         // Populated by reloadLevels() every time the window opens, since the display list is
         // not fixed. Empty at build time.
@@ -439,16 +545,63 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         levelsStack.orientation = .vertical
         levelsStack.alignment = .leading
         levelsStack.spacing = 6
-        root.addArrangedSubview(levelsStack)
+        general.addArrangedSubview(levelsStack)
 
-        root.addArrangedSubview(NSBox.separator())
-        root.addArrangedSubview(label("Shortcuts", 13, .semibold))
-        root.addArrangedSubview(paragraph(
-            "These work in any app. Each one needs a modifier key."))
+        general.addArrangedSubview(NSBox.separator())
+        general.addArrangedSubview(label("Pause the boost for these apps", 13, .semibold))
+        general.addArrangedSubview(paragraph(
+            "The boost switches off while one of these is frontmost."))
+
+        excludedTable = NSTableView()
+        excludedTable.headerView = nil
+        excludedTable.rowHeight = 20
+        excludedTable.dataSource = self
+        excludedTable.delegate = self
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("bundle"))
+        column.width = 380
+        excludedTable.addTableColumn(column)
+
+        let scroll = NSScrollView()
+        scroll.documentView = excludedTable
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.heightAnchor.constraint(equalToConstant: 90).isActive = true
+        scroll.widthAnchor.constraint(equalToConstant: Self.contentWidth).isActive = true
+        general.addArrangedSubview(scroll)
+
+        let add = NSButton(title: "Add App…", target: self, action: #selector(addExcluded))
+        let remove = NSButton(title: "Remove", target: self, action: #selector(removeExcluded))
+        let buttons = NSStackView(views: [add, remove])
+        buttons.orientation = .horizontal
+        buttons.spacing = 8
+        general.addArrangedSubview(buttons)
+
+        general.addArrangedSubview(NSBox.separator())
+        general.addArrangedSubview(label("HDR trigger corner", 13, .semibold))
+        general.addArrangedSubview(paragraph(
+            "Where the 1×1 pixel that turns on HDR sits."))
+
+        let corner = NSPopUpButton(frame: .zero, pullsDown: false)
+        // Default first, so the `?? 0` fallback lands on it for an unset or unrecognised pref.
+        corner.addItems(withTitles: ["Top Right", "Top Left", "Bottom Right", "Bottom Left"])
+        corner.selectItem(at: SettingsWindowController.corners
+            .firstIndex(of: UserDefaults.standard.string(forKey: "TriggerCorner") ?? "topRight") ?? 0)
+        corner.target = self
+        corner.action = #selector(cornerChanged(_:))
+        general.addArrangedSubview(corner)
+
+        // MARK: Shortcuts
+
+        let shortcuts = pane("Shortcuts", symbol: "keyboard")
+        shortcuts.addArrangedSubview(paragraph(
+            "These work in any app. Click one to record it; each needs a modifier key."))
 
         let grid = NSGridView(numberOfColumns: 2, rows: 0)
         grid.rowSpacing = 8
         grid.columnSpacing = 14
+        grid.translatesAutoresizingMaskIntoConstraints = false
+        grid.widthAnchor.constraint(equalToConstant: Self.contentWidth).isActive = true
         for action in ShortcutAction.allCases {
             let recorder = ShortcutRecorder(frame: NSRect(x: 0, y: 0, width: 140, height: 26))
             recorder.translatesAutoresizingMaskIntoConstraints = false
@@ -468,75 +621,37 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             text.orientation = .vertical
             text.alignment = .leading
             text.spacing = 1
+            // The text column takes the slack, which puts the recorders on the trailing edge.
+            text.setHuggingPriority(.init(1), for: .horizontal)
             grid.addRow(with: [text, recorder])
         }
-        root.addArrangedSubview(grid)
+        shortcuts.addArrangedSubview(grid)
 
-        root.addArrangedSubview(NSBox.separator())
-        root.addArrangedSubview(label("HDR trigger corner", 13, .semibold))
-        root.addArrangedSubview(paragraph(
-            "Where the 1×1 pixel that turns on HDR sits."))
+        // MARK: Experimental
 
-        let corner = NSPopUpButton(frame: .zero, pullsDown: false)
-        // Default first, so the `?? 0` fallback lands on it for an unset or unrecognised pref.
-        corner.addItems(withTitles: ["Top Right", "Top Left", "Bottom Right", "Bottom Left"])
-        corner.selectItem(at: SettingsWindowController.corners
-            .firstIndex(of: UserDefaults.standard.string(forKey: "TriggerCorner") ?? "topRight") ?? 0)
-        corner.target = self
-        corner.action = #selector(cornerChanged(_:))
-        root.addArrangedSubview(corner)
-
-        root.addArrangedSubview(NSBox.separator())
-        root.addArrangedSubview(label("Pause the boost for these apps", 13, .semibold))
-        root.addArrangedSubview(paragraph(
-            "The boost switches off while one of these is frontmost."))
-
-        excludedTable = NSTableView()
-        excludedTable.headerView = nil
-        excludedTable.rowHeight = 20
-        excludedTable.dataSource = self
-        excludedTable.delegate = self
-        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("bundle"))
-        column.width = 380
-        excludedTable.addTableColumn(column)
-
-        let scroll = NSScrollView()
-        scroll.documentView = excludedTable
-        scroll.hasVerticalScroller = true
-        scroll.borderType = .bezelBorder
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.heightAnchor.constraint(equalToConstant: 90).isActive = true
-        scroll.widthAnchor.constraint(equalToConstant: Self.contentWidth).isActive = true
-        root.addArrangedSubview(scroll)
-
-        let add = NSButton(title: "Add App…", target: self, action: #selector(addExcluded))
-        let remove = NSButton(title: "Remove", target: self, action: #selector(removeExcluded))
-        let buttons = NSStackView(views: [add, remove])
-        buttons.orientation = .horizontal
-        buttons.spacing = 8
-        root.addArrangedSubview(buttons)
-
-        root.addArrangedSubview(NSBox.separator())
-        root.addArrangedSubview(label("Space Layout Protection — Experimental", 13, .semibold,
-                                      .systemOrange))
-        root.addArrangedSubview(paragraph(
+        // The tab is named for what it is; the heading keeps the feature's full title, which
+        // is the name the README and CLAUDE.md send people looking for.
+        let experimental = pane("Experimental", symbol: "testtube.2")
+        experimental.addArrangedSubview(label("Space Layout Protection — Experimental", 13,
+                                              .semibold, .systemOrange))
+        experimental.addArrangedSubview(paragraph(
             "Space writes are not production-validated. A failed restore or conversion may "
             + "leave extra desktops or partially changed normal windows."))
 
         experimentalWritesButton = NSButton(
             checkboxWithTitle: "Enable Experimental Space Writes", target: self,
             action: #selector(experimentalWritesChanged(_:)))
-        root.addArrangedSubview(experimentalWritesButton)
+        experimental.addArrangedSubview(experimentalWritesButton)
 
         automaticRestoreButton = NSButton(
             checkboxWithTitle: "Automatically Restore Layouts", target: self,
             action: #selector(automaticSpaceRestoreChanged(_:)))
-        root.addArrangedSubview(automaticRestoreButton)
+        experimental.addArrangedSubview(automaticRestoreButton)
 
         spaceStatusLabel = paragraph("Experimental Space writes are disabled.")
         spaceStatusLabel.textColor = .secondaryLabelColor
-        root.addArrangedSubview(spaceStatusLabel)
-        root.addArrangedSubview(paragraph(
+        experimental.addArrangedSubview(spaceStatusLabel)
+        experimental.addArrangedSubview(paragraph(
             "Layouts stay separate per physical display setup. ● marks the profile restored "
             + "for that exact setup."))
 
@@ -545,7 +660,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         setupPopup.action = #selector(setupChanged)
         setupPopup.translatesAutoresizingMaskIntoConstraints = false
         setupPopup.widthAnchor.constraint(equalToConstant: Self.contentWidth).isActive = true
-        root.addArrangedSubview(setupPopup)
+        experimental.addArrangedSubview(setupPopup)
 
         profileTable = NSTableView()
         profileTable.headerView = nil
@@ -565,7 +680,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         profileScroll.translatesAutoresizingMaskIntoConstraints = false
         profileScroll.heightAnchor.constraint(equalToConstant: 88).isActive = true
         profileScroll.widthAnchor.constraint(equalToConstant: Self.contentWidth).isActive = true
-        root.addArrangedSubview(profileScroll)
+        experimental.addArrangedSubview(profileScroll)
 
         // Two rows: five buttons do not fit across 400pt without truncating their titles.
         let saveAs = NSButton(title: "Save Current As…", target: self, action: #selector(saveProfile))
@@ -576,46 +691,24 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let topRow = NSStackView(views: [saveAs, use, restoreNow])
         topRow.orientation = .horizontal
         topRow.spacing = 8
-        root.addArrangedSubview(topRow)
+        experimental.addArrangedSubview(topRow)
 
         let rename = NSButton(title: "Rename", target: self, action: #selector(renameProfile))
         let delete = NSButton(title: "Delete", target: self, action: #selector(deleteProfile))
         let bottomRow = NSStackView(views: [rename, delete])
         bottomRow.orientation = .horizontal
         bottomRow.spacing = 8
-        root.addArrangedSubview(bottomRow)
+        experimental.addArrangedSubview(bottomRow)
         profileEditingButtons = [use, rename, delete]
 
         convertFullscreenButton = NSButton(
             title: "Convert Fullscreen Apps to Dedicated Desktops…", target: self,
             action: #selector(convertFullscreenAppsNow))
-        root.addArrangedSubview(convertFullscreenButton)
+        experimental.addArrangedSubview(convertFullscreenButton)
 
-        // Scrolled rather than merely sized to fit. Five sections of content is taller than a
-        // laptop screen, and a window sized to its content simply ran off the bottom, taking
-        // the buttons with it — which is not something the user can scroll to.
-        contentStack = root
-        let outer = NSScrollView()
-        outer.hasVerticalScroller = true
-        outer.autohidesScrollers = true
-        outer.drawsBackground = false
-        outer.borderType = NSBorderType.noBorder
-        outer.documentView = root
-        window?.contentView = outer
-        NSLayoutConstraint.activate([
-            root.topAnchor.constraint(equalTo: outer.contentView.topAnchor),
-            root.leadingAnchor.constraint(equalTo: outer.contentView.leadingAnchor),
-            root.trailingAnchor.constraint(equalTo: outer.contentView.trailingAnchor),
-        ])
-
-        // The contentRect passed to NSWindow is a guess; the stack knows the real height once
-        // the wrapping labels have broken.
-        root.layoutSubtreeIfNeeded()
-        let fitting = root.fittingSize
-        let ceiling = (window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 900
-        window?.setContentSize(NSSize(width: fitting.width,
-                                      height: min(fitting.height, ceiling - 60)))
-        window?.minSize = NSSize(width: fitting.width, height: 320)
+        window?.contentViewController = tabs
+        window?.toolbarStyle = .preference
+        sizePanes()
     }
 
     // MARK: - Actions
@@ -674,10 +767,12 @@ extension SettingsWindowController: NSTextFieldDelegate {
         }
     }
 
-    /// Clicking away is not a commit — Return is. This also makes the end-of-editing that
-    /// follows a Return harmless, because committing already moved revertText forward.
+    /// Tab and clicking away commit, the way every other field on the Mac behaves. Reverting
+    /// here instead silently threw away what had just been typed. The end-of-editing that
+    /// follows a Return or an Escape arrives here too and is harmless: by then the text is
+    /// what the field already holds, which `commit` does not apply a second time.
     func controlTextDidEndEditing(_ notification: Notification) {
-        (notification.object as? PercentField)?.revert()
+        (notification.object as? PercentField)?.commit()
     }
 }
 
@@ -696,10 +791,37 @@ extension SettingsWindowController: NSTableViewDataSource, NSTableViewDelegate {
             return field
         }
         guard row < excluded.count else { return nil }
-        let field = NSTextField(labelWithString: excluded[row])
-        field.font = .systemFont(ofSize: 11)
-        return field
+        let app = Self.app(for: excluded[row])
+        let icon = NSImageView(image: app.icon)
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.widthAnchor.constraint(equalToConstant: 16).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 16).isActive = true
+        let name = NSTextField(labelWithString: app.name)
+        name.font = .systemFont(ofSize: 11)
+        name.lineBreakMode = .byTruncatingTail
+        let cell = NSStackView(views: [icon, name])
+        cell.spacing = 6
+        // The ID is what the pref holds and what `defaults write` takes, so keep it findable.
+        cell.toolTip = excluded[row]
+        return cell
     }
+
+    /// What the excluded list shows for a bundle ID: the app's own name and icon. The pref
+    /// stays a list of IDs and is scriptable, so one naming an app that is not on this Mac is
+    /// legitimate — that row shows the raw ID rather than disappearing.
+    static func app(for bundleID: String) -> (name: String, icon: NSImage) {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+            return (bundleID, NSWorkspace.shared.icon(for: .application))
+        }
+        return (FileManager.default.displayName(atPath: url.path),
+                NSWorkspace.shared.icon(forFile: url.path))
+    }
+}
+
+/// A clip view's origin is its bottom-left, so a document taller than it opens scrolled to
+/// the end. Flipped, a pane that has to scroll starts at its first row.
+private final class TopClipView: NSClipView {
+    override var isFlipped: Bool { true }
 }
 
 private extension NSBox {

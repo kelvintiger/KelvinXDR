@@ -32,7 +32,7 @@ enum Percent {
     static func text(_ fraction: Double) -> String { "\(Int((fraction * 100).rounded()))" }
 }
 
-/// A small numeric field that commits on Return and reverts on Escape.
+/// A small numeric field that commits when editing ends and reverts on Escape.
 final class PercentField: NSTextField {
     var maxValue: Double = 1
     var onCommit: ((Double) -> Void)?
@@ -43,6 +43,10 @@ final class PercentField: NSTextField {
     }
 
     func commit() {
+        // Unchanged text is not an entry. Editing ends once on Return and again when focus
+        // then leaves, and a field that merely held the focus when the window closed was
+        // never typed into — neither should re-apply a level.
+        guard stringValue != revertText else { return }
         guard let value = Percent.parse(stringValue, max: maxValue) else {
             stringValue = revertText
             return
