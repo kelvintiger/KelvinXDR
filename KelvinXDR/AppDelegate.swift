@@ -353,8 +353,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 
-        // The initial read-only capability inventory can complete immediately. Space controls
-        // live only in Settings, so its callback refreshes that window without adding menu UI.
+        // The read-only capability inventory lands asynchronously — after launch when the
+        // experimental gate is on, after the Settings window first opens otherwise. Space
+        // controls live only in Settings, so its callback refreshes that window without
+        // adding menu UI.
         spaces.onChange = { [weak self] in
             if self?.settingsController?.window?.isVisible == true {
                 self?.settingsController?.reload()
@@ -438,26 +440,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         DispatchQueue.global(qos: .userInitiated).async {
             let services = DDC.services()
+            // The built-in never takes part: it has no I2C channel, and leaving it out is
+            // what lets "the only external screen left" mean something in DDC.match.
+            let externals = screens.filter { CGDisplayIsBuiltin($0.0) == 0 }
+            let bound = DDC.match(
+                screens: externals.map { (Int64(CGDisplaySerialNumber($0.0)), $0.1) },
+                services: services.map { ($0.serial, $0.product) })
+            var serviceFor: [CGDirectDisplayID: IOAVService] = [:]
+            for (index, service) in bound.enumerated() {
+                if let service = service { serviceFor[externals[index].0] = services[service].service }
+            }
             var found: [ManagedDisplay] = []
 
             for (id, name) in screens {
                 let isBuiltIn = CGDisplayIsBuiltin(id) != 0
-                let service = isBuiltIn ? nil : services[Int64(CGDisplaySerialNumber(id))]
 
-                if let service = service {
+                if let service = serviceFor[id] {
                     let b = DDC.read(service, DDC.brightness)
                     let c = DDC.read(service, DDC.contrast)
                     let v = DDC.read(service, DDC.volume)
-                    let m = DDC.read(service, DDC.mute)
+                    // No volume register means no speakers, and a mute read against a
+                    // monitor that will not answer it is over a second of retries.
+                    let m = v == nil ? nil : DDC.read(service, DDC.mute)
                     let bMax = max(b?.max ?? 100, 1)
-                    found.append(ManagedDisplay(
+                    let display = ManagedDisplay(
                         id: id, name: name, isBuiltIn: false, hardware: .ddc(service),
                         ddcBrightnessMax: bMax, ddcVolumeMax: max(v?.max ?? 100, 1),
                         ddcContrastMax: max(c?.max ?? 100, 1), hasAudio: v != nil,
-                        brightness: Double(b?.current ?? bMax) / Double(bMax),
                         volume: Double(v?.current ?? 0) / Double(max(v?.max ?? 100, 1)),
                         contrast: Double(c?.current ?? 70) / Double(max(c?.max ?? 100, 1)),
-                        muted: m?.current == 1))
+                        muted: m?.current == 1)
+                    // The register is only the hardware segment of the combined scale, so it
+                    // goes through the inverse of split() — the same one refreshDDCRows uses.
+                    display.brightness = display.combined(
+                        hardware: Double(b?.current ?? bMax) / Double(bMax))
+                    found.append(display)
                 } else if isBuiltIn || AppleBrightness.supported(id) {
                     // Backlight only — the built-in's gamma table belongs to the XDR boost,
                     // so combined dimming is off here to keep the two from fighting.
@@ -941,7 +958,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
     }
 
-    @objc private func openSettings() { settings.show() }
+    @objc private func openSettings() {
+        // The Space section is about to ask SkyLight what it can do, so this is where the
+        // private-API probe that launch skipped finally runs. See SpaceLayoutManager.start.
+        spaces.probeRuntime()
+        settings.show()
+    }
 
     @objc private func frontmostAppChanged() {
         let frontmost = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
@@ -977,10 +999,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let snapshot = (display.brightness, display.contrast, display.volume)
             DispatchQueue.global(qos: .userInitiated).async { [weak self, weak display] in
                 guard let display = display, let service = display.ddcService else { return }
-                let b = DDC.read(service, DDC.brightness)
-                let c = DDC.read(service, DDC.contrast)
-                let v = DDC.read(service, DDC.volume)
-                let m = DDC.read(service, DDC.mute)
+                // One retry, not the default four: the bus lock is held across every retry,
+                // so a slider dragged in the menu that just opened waits behind these reads.
+                // A miss costs nothing — the row keeps the value it already shows. And a
+                // monitor with no speakers is never asked for volume or mute at all, which
+                // on such a panel was most of the wait.
+                let b = DDC.read(service, DDC.brightness, retries: 1)
+                let c = DDC.read(service, DDC.contrast, retries: 1)
+                let v = display.hasAudio ? DDC.read(service, DDC.volume, retries: 1) : nil
+                let m = display.hasAudio ? DDC.read(service, DDC.mute, retries: 1) : nil
                 CFRunLoopPerformBlock(CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue) {
                     guard let self = self,
                           (display.brightness, display.contrast, display.volume) == snapshot
@@ -991,8 +1018,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         // unknowable from the monitor, so the cache stands.
                         let hw = Double(b.current) / Double(display.ddcBrightnessMax)
                         if hw > 0 {
-                            let f = display.softwareFraction
-                            display.brightness = f + hw * (1 - f)
+                            display.brightness = display.combined(hardware: hw)
                             self.sync(display, .brightness, display.brightness)
                         }
                     }
@@ -1148,11 +1174,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// cannot drift apart in what they actually do.
     private func applyRow(_ display: ManagedDisplay, _ kind: Row, _ value: Double) {
         switch kind {
-        case .brightness where display.isBuiltIn:
-            setLevel(Float(value))
-            sync(display, .brightness, value)
-
         case .brightness:
+            // One case for the built-in's slider and an external's alike, so Sync All runs
+            // both ways. It used to be one-directional: an external's slider moved the
+            // built-in, the built-in's own slider moved nothing else.
             let targets = syncAll ? displays.filter { $0.hasHardware || $0.softwareFraction > 0 } : [display]
             for target in targets {
                 // The built-in lives on the 0...1.59 level model. Routing it through the raw
@@ -1164,8 +1189,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     setLevel(Float(value))
                     sync(target, .brightness, value)
                 } else {
-                    applyBrightness(target, value, animated: false)
-                    sync(target, .brightness, value)
+                    // Only the built-in has a range above 100%; its slider past that point
+                    // holds every other display at full.
+                    let capped = min(value, 1)
+                    applyBrightness(target, capped, animated: false)
+                    sync(target, .brightness, capped)
                 }
             }
 

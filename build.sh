@@ -1,7 +1,8 @@
 #!/bin/bash
 # Build KelvinXDR.app without Xcode — needs only the Command Line Tools (swiftc + SDK).
 #   ./build.sh          build
-#   ./build.sh run      build, then relaunch
+#   ./build.sh run      build, then relaunch from build/
+#   ./build.sh install  build, swap the result into /Applications, launch it
 #   ./build.sh test     run the hardware-free logic checks
 #
 # Set STRICT=1 to fail the build on warnings (CI does).
@@ -26,8 +27,11 @@ if [ "${STRICT:-}" = "1" ]; then STRICT_FLAGS="-warnings-as-errors"; fi
 # the mock. See Tests/main.swift.
 if [ "$CMD" = "test" ]; then
     mkdir -p build
-    # The bridging header + IOKit are for DDC.swift, whose reply parser is pure logic worth
-    # checking; the I2C entry points it also declares resolve from the SDK's IOKit stubs.
+    # The bridging header + IOKit are for DDC.swift, whose reply parser and screen matcher
+    # are pure logic worth checking; the I2C entry points it also declares resolve from the
+    # SDK's IOKit stubs. DisplayControl.swift is here for ManagedDisplay's split/combined
+    # arithmetic, and drags in Shade.swift and AppleBrightness.swift only so it links —
+    # nothing in the tests constructs a DisplayController, so neither is ever called.
     swiftc $STRICT_FLAGS \
         -sdk "$(xcrun --show-sdk-path)" \
         -target "$(uname -m)-apple-macos13.1" \
@@ -36,6 +40,8 @@ if [ "$CMD" = "test" ]; then
         -o build/KelvinXDRTests \
         Tests/main.swift KelvinXDR/Detent.swift KelvinXDR/AudioOutput.swift KelvinXDR/Shortcuts.swift KelvinXDR/Settings.swift KelvinXDR/GammaBoost.swift \
         KelvinXDR/MediaKeys.swift KelvinXDR/PercentField.swift KelvinXDR/OSD.swift KelvinXDR/DDC.swift \
+        KelvinXDR/DisplayControl.swift KelvinXDR/Shade.swift KelvinXDR/AppleBrightness.swift \
+        KelvinXDR/MainMenu.swift \
         KelvinXDR/SpaceSnapshot.swift KelvinXDR/SpacePlanner.swift
     exec build/KelvinXDRTests
 fi
@@ -54,7 +60,7 @@ swiftc -O $STRICT_FLAGS \
     KelvinXDR/AppleBrightness.swift KelvinXDR/Shade.swift KelvinXDR/DisplayControl.swift \
     KelvinXDR/AudioOutput.swift KelvinXDR/Detent.swift \
     KelvinXDR/Shortcuts.swift KelvinXDR/Settings.swift \
-    KelvinXDR/SystemOSD.swift KelvinXDR/PercentField.swift \
+    KelvinXDR/SystemOSD.swift KelvinXDR/PercentField.swift KelvinXDR/MainMenu.swift \
     KelvinXDR/SpaceSnapshot.swift KelvinXDR/SpacePlanner.swift KelvinXDR/SkyLightSpaces.swift \
     KelvinXDR/MissionControlDesktopCreator.swift KelvinXDR/WindowAccessibility.swift \
     KelvinXDR/SpaceLayoutManager.swift

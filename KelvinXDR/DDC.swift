@@ -27,15 +27,22 @@ enum DDC {
 
     // MARK: - Discovery
 
-    /// EDID serial number -> I2C service, for every externally connected display.
+    /// The I2C service of every externally connected display, with the EDID serial and
+    /// product name the registry reports beside it. `match` decides which screen each drives.
     ///
-    /// ponytail: matched on serial alone, which is exact on this hardware. MonitorControl
-    /// runs a 20-point fuzzy match over vendor/product/manufacture-date/image-size because
-    /// serials can be zero or collide on cheap panels. Upgrade to that if a display ever
-    /// binds to the wrong slider.
-    static func services() -> [Int64: IOAVService] {
-        var found: [Int64: IOAVService] = [:]
-        var current: (serial: Int64, product: String) = (0, "")
+    /// ponytail: identity is serial, then product name, then "the only one left". Plenty of
+    /// monitors report serial 0 or share one serial across a production run, which is why
+    /// serial alone was not enough — but this is still far short of MonitorControl's 20-point
+    /// fuzzy match over vendor/product/manufacture-date/image-size. The ceiling: two monitors
+    /// of the same model whose serials are zero or equal cannot be told apart, so neither
+    /// binds and both fall back to the shade. Upgrade to the fuzzy match (or a per-display
+    /// override pref) if that pair turns up.
+    static func services() -> [(serial: Int64, product: String, service: IOAVService)] {
+        var found: [(serial: Int64, product: String, service: IOAVService)] = []
+        // nil until a framebuffer with EDID attributes is seen: a port with nothing plugged
+        // in still has a framebuffer node, and a service under it is nobody's monitor.
+        var current: (serial: Int64, product: String)?
+        var slot: Int?
 
         let root = IORegistryGetRootEntry(kIOMainPortDefault)
         defer { IOObjectRelease(root) }
@@ -56,22 +63,72 @@ enum DDC {
             defer { IOObjectRelease(entry) }
 
             if framebuffers.contains(name) {
-                current = (0, "")
+                current = nil
+                slot = nil
                 if let attrs = property(entry, "DisplayAttributes") as? NSDictionary,
                    let product = attrs.value(forKey: "ProductAttributes") as? NSDictionary {
-                    current.serial = product.value(forKey: "SerialNumber") as? Int64 ?? 0
-                    current.product = product.value(forKey: "ProductName") as? String ?? ""
+                    current = (product.value(forKey: "SerialNumber") as? Int64 ?? 0,
+                               product.value(forKey: "ProductName") as? String ?? "")
                 }
             } else if name == "DCPAVServiceProxy" {
                 // "Embedded" is the built-in panel — it has no I2C channel.
                 guard let location = property(entry, "Location") as? String, location == "External",
-                      current.serial != 0,
+                      let identity = current,
                       let service = IOAVServiceCreateWithService(kCFAllocatorDefault, entry)?
                           .takeRetainedValue() as IOAVService? else { continue }
-                found[current.serial] = service
+                // One entry per framebuffer, last proxy wins — what keying by serial used to
+                // do. Two entries for one monitor would read as a duplicated serial below
+                // and refuse to bind.
+                if let slot = slot {
+                    found[slot] = (identity.serial, identity.product, service)
+                } else {
+                    slot = found.count
+                    found.append((identity.serial, identity.product, service))
+                }
             }
         }
         return found
+    }
+
+    /// Which service drives which screen: per screen, an index into `services`, or nil.
+    /// Pure, so the hardware-free tests can cover it. Pass external screens only.
+    ///
+    /// Three passes, each over what the one before left unclaimed:
+    ///   1. EDID serial, when it is non-zero and one screen and one service hold it.
+    ///   2. Product name against the screen's name, again strictly one to one.
+    ///   3. Exactly one screen and one service left: they are each other's.
+    ///
+    /// Anything ambiguous stays unbound and takes the shade fallback. Never guess between
+    /// identical candidates — a wrong bind is not a missing slider, it is a slider that
+    /// drives the *other* monitor.
+    static func match(screens: [(serial: Int64, name: String)],
+                      services: [(serial: Int64, product: String)]) -> [Int?] {
+        var bound = [Int?](repeating: nil, count: screens.count)
+        var freeScreens: [Int] { screens.indices.filter { bound[$0] == nil } }
+        var freeServices: [Int] { services.indices.filter { !bound.contains($0) } }
+
+        func bindOneToOne(_ same: (_ screen: Int, _ service: Int) -> Bool) {
+            // Judged against one snapshot, not as binds land: a pair that only becomes
+            // unique because a neighbour was just claimed belongs to a later pass.
+            let (candidates, pool) = (freeScreens, freeServices)
+            for screen in candidates {
+                let matches = pool.filter { same(screen, $0) }
+                guard matches.count == 1,
+                      candidates.filter({ same($0, matches[0]) }).count == 1 else { continue }
+                bound[screen] = matches[0]
+            }
+        }
+
+        bindOneToOne { screens[$0].serial != 0 && screens[$0].serial == services[$1].serial }
+        // NSScreen numbers identically named displays — "LG Ultra HD (2)" — where the EDID
+        // has the bare model name. AudioOutput.matches already strips that suffix for the
+        // same reason, so it is the comparison to reuse.
+        bindOneToOne {
+            !services[$1].product.isEmpty
+                && AudioOutput.matches(displayName: screens[$0].name, output: services[$1].product)
+        }
+        if freeScreens.count == 1, freeServices.count == 1 { bound[freeScreens[0]] = freeServices[0] }
+        return bound
     }
 
     private static func property(_ entry: io_service_t, _ key: String) -> Any? {
@@ -102,10 +159,15 @@ enum DDC {
 
     // MARK: - I2C
 
-    static func read(_ service: IOAVService, _ command: UInt8) -> (current: UInt16, max: UInt16)? {
+    /// - retries: each one costs ~240ms against a register the monitor never answers, with
+    ///   the bus lock held throughout — so a refresh that only wants a fresher number than
+    ///   the one it already has should pass a low value.
+    static func read(_ service: IOAVService, _ command: UInt8,
+                     retries: Int = 4) -> (current: UInt16, max: UInt16)? {
         var send: [UInt8] = [command]
         var reply = [UInt8](repeating: 0, count: 11)
-        guard communicate(service, send: &send, reply: &reply, expecting: command) else { return nil }
+        guard communicate(service, send: &send, reply: &reply, retries: retries,
+                          expecting: command) else { return nil }
         return parseReply(reply, command: command)
     }
 

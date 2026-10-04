@@ -82,6 +82,19 @@ final class ManagedDisplay {
         guard f < 1 else { return (0, v) }
         return v >= f ? ((v - f) / (1 - f), 1) : (0, v / f)
     }
+
+    /// The inverse of `split` for the hardware part: where a hardware level read back from
+    /// the panel sits on the combined scale.
+    ///
+    /// Everything that turns a register value into `brightness` has to come through here. A
+    /// raw register fraction is low by `f * (1 - hardware)`, and a model seeded with it made
+    /// the next brightness-up key write a *lower* hardware value than the monitor already had.
+    /// At hardware zero the software share is unknowable from the panel; this answers `f`,
+    /// the top of the software range.
+    func combined(hardware: Double) -> Double {
+        let f = softwareFraction
+        return f + min(max(hardware, 0), 1) * (1 - f)
+    }
 }
 
 /// Applies brightness changes, optionally easing into them.
