@@ -446,17 +446,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let bound = DDC.match(
                 screens: externals.map { (Int64(CGDisplaySerialNumber($0.0)), $0.1) },
                 services: services.map { ($0.serial, $0.product) })
-            var serviceFor: [CGDirectDisplayID: IOAVService] = [:]
+            var serviceFor: [CGDirectDisplayID: (serial: Int64, service: IOAVService)] = [:]
             for (index, service) in bound.enumerated() {
-                if let service = service { serviceFor[externals[index].0] = services[service].service }
+                if let service = service {
+                    serviceFor[externals[index].0] = (services[service].serial, services[service].service)
+                }
             }
             var found: [ManagedDisplay] = []
 
             for (id, name) in screens {
                 let isBuiltIn = CGDisplayIsBuiltin(id) != 0
+                let b = serviceFor[id].flatMap { DDC.read($0.service, DDC.brightness) }
 
-                if let service = serviceFor[id] {
-                    let b = DDC.read(service, DDC.brightness)
+                // A display that fails this keeps whatever it had before DDC.match learned to
+                // bind without a serial: the native protocol, or the shade.
+                if let (serial, service) = serviceFor[id],
+                   DDC.drives(screenSerial: Int64(CGDisplaySerialNumber(id)),
+                              serviceSerial: serial, answered: b != nil) {
                     let c = DDC.read(service, DDC.contrast)
                     let v = DDC.read(service, DDC.volume)
                     // No volume register means no speakers, and a mute read against a

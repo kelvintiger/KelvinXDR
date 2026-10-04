@@ -5,7 +5,7 @@
 //  The main menu nobody ever sees.
 //
 //  An LSUIElement app has no menu bar of its own, and with no nib there is no default menu
-//  either — so there was nothing for ⌘W, ⌘Q, ⌘C, ⌘V or ⌘A to resolve against. They were
+//  either — so there was nothing for ⌘W, ⌘C, ⌘V or ⌘A to resolve against. They were
 //  simply dead in the Settings window and in the layout-name prompt: a text field you could
 //  not paste into. Key equivalents are looked up in `NSApp.mainMenu` whether or not it is
 //  ever drawn, so installing one is the whole fix.
@@ -36,9 +36,12 @@ enum MainMenu {
             return item
         }
 
-        submenu("KelvinXDR", [
-            item("Quit KelvinXDR", #selector(NSApplication.terminate(_:)), "q"),
-        ])
+        // Deliberately no Quit. An accessory app can stay the active app with no window left —
+        // after Settings or an alert closes — while the menu bar still shows the previous
+        // app's menus, and ⌘Q would then quit KelvinXDR rather than the app the user is
+        // looking at. Quit lives in the status menu, where it is unmistakably ours. The empty
+        // submenu stays because AppKit takes the first one to be the application menu.
+        submenu("KelvinXDR", [])
         submenu("File", [
             item("Close Window", #selector(NSWindow.performClose(_:)), "w"),
         ])

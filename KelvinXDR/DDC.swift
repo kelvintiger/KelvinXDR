@@ -131,6 +131,17 @@ enum DDC {
         return bound
     }
 
+    /// Whether a display `match` bound should be driven over DDC at all.
+    ///
+    /// A serial that matches is the monitor's own word for which service is its own, so that
+    /// bind stands even when a read fails — a slow first reply is no reason to lose the
+    /// slider. A bind by name or as the leftover pair is an inference, and has to be backed
+    /// by a brightness read that came back: a dock that drops the I2C channel otherwise
+    /// leaves a slider that moves nothing, where the shade overlay would at least have dimmed.
+    static func drives(screenSerial: Int64, serviceSerial: Int64, answered: Bool) -> Bool {
+        (screenSerial != 0 && screenSerial == serviceSerial) || answered
+    }
+
     private static func property(_ entry: io_service_t, _ key: String) -> Any? {
         IORegistryEntryCreateCFProperty(entry, key as CFString, kCFAllocatorDefault,
                                         IOOptionBits(kIORegistryIterateRecursively))?.takeRetainedValue()

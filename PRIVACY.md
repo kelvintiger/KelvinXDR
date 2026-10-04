@@ -4,10 +4,10 @@ Last updated: 4 October 2026
 
 ## The app collects and transmits nothing
 
-KelvinXDR does not collect, store or transmit any personal data. It makes no network
-requests of its own. Everything it does — reading and writing the gamma transfer table,
-talking to monitors over DDC/CI, watching for media keys — happens locally on your Mac,
-between the app and your hardware.
+KelvinXDR does not collect or transmit any personal data, and what it stores stays on your
+Mac. It makes no network requests of its own. Everything it does — reading and writing the
+gamma transfer table, talking to monitors over DDC/CI, watching for media keys — happens
+locally on your Mac, between the app and your hardware.
 
 There is no account, no sign-in, no server behind this app. Nothing to leak, because
 nothing is sent anywhere.
