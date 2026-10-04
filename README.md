@@ -122,7 +122,8 @@ for each physical display topology and moving normal windows back to their saved
 slots. A Space UUID is recorded as a diagnostic hint, but the visible logical position among
 type-0 normal Spaces is authoritative.
 
-The feature has no menu-bar item. Open Settings -> **Space Layout Protection — Experimental**.
+The feature has no menu-bar item. Open Settings -> **Experimental**, the tab headed **Space
+Layout Protection — Experimental**.
 Saving a named profile does not write Spaces and remains available when its read capabilities
 exist. Restore, automatic restoration, desktop creation, and fullscreen conversion remain
 disabled until **Enable Experimental Space Writes** is checked. **Automatically Restore
@@ -142,8 +143,7 @@ saved or display-relative frame. Windows saved as maximized are maximized with n
 
 **Named layouts**
 
-Settings -> **Space Layout Protection — Experimental** lists what is saved, one setup at a
-time. Every setup has an
+Settings -> **Experimental** lists what is saved, one setup at a time. Every setup has an
 **Auto-saved** history populated by explicit saves and can also hold named photographs such as
 "Standard", "Docked", or "Presenting". The layout marked ● is authoritative for that exact
 physical setup. All profile reads and mutations are serialized with background layout work.
@@ -259,9 +259,10 @@ security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db 
 
 ## Settings
 
-Everyday display sliders and toggles live in the menu bar. Shortcut recording, typed
-percentages, the EDR trigger corner, the excluded-app list, and all Experimental Space Layout
-Protection controls live in the settings window (Cmd+, from the menu).
+Everyday display sliders and toggles live in the menu bar. The settings window (Cmd+, from
+the menu) has three tabs: **General** for typed percentages, the excluded-app list and the EDR
+trigger corner, **Shortcuts** for shortcut recording, and **Experimental** for all Space
+Layout Protection controls.
 The same preferences are scriptable:
 
 ```bash

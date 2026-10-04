@@ -173,12 +173,14 @@ expect(true, "apply after prepareForTermination is refused without trapping")
 // NSTextField(labelWithString:) is single-line: its intrinsic width is the whole string, so
 // one long sentence silently widened the window until the text clipped against the frame.
 // Caught by eye, not by a test, which is why this exists. Pure AppKit — no hardware.
-section("Settings — the window fits its content")
+section("Settings — three toolbar tabs, each sized to its content")
 _ = NSApplication.shared
 NSApplication.shared.setActivationPolicy(.accessory)
 
 let settings = SettingsWindowController()
 var testExperimentalWrites = false
+var appliedLevels: [Double] = []
+var levelRows = 4
 settings.experimentalWritesEnabled = { testExperimentalWrites }
 settings.automaticSpaceRestoreEnabled = { false }
 settings.canCaptureSpaceLayout = { true }
@@ -188,87 +190,213 @@ settings.canConvertFullscreenApps = { testExperimentalWrites }
 // anything real — an unconstrained label there would widen the window exactly the way the
 // wrapping paragraphs once did.
 settings.values = {
-    [.init(title: "Built-in Retina Display — Brightness", fraction: 1.0, maxFraction: 1.59) { _ in },
-     .init(title: "LG Ultra HD (1) — Brightness", fraction: 0.5, maxFraction: 1) { _ in },
-     .init(title: "LG Ultra HD (1) — Contrast", fraction: 0.75, maxFraction: 1) { _ in },
-     .init(title: String(repeating: "Absurdly Long Display Name ", count: 6) + "— Volume",
-           fraction: 0.3, maxFraction: 1) { _ in }]
+    let sample: [SettingsWindowController.Value] =
+        [.init(title: "Built-in Retina Display — Brightness", fraction: 1.0, maxFraction: 1.59) { _ in },
+         .init(title: "LG Ultra HD (1) — Brightness", fraction: 0.5, maxFraction: 1) { appliedLevels.append($0) },
+         .init(title: "LG Ultra HD (1) — Contrast", fraction: 0.75, maxFraction: 1) { _ in },
+         .init(title: String(repeating: "Absurdly Long Display Name ", count: 6) + "— Volume",
+               fraction: 0.3, maxFraction: 1) { _ in }]
+    return (0..<levelRows).map { sample[$0 % sample.count] }
+}
+settings.spaceProfileCatalog = {
+    SpaceProfileCatalog(setups: [.init(
+        topologyID: PhysicalTopologyID("T"), description: "Built-in + LG Ultra HD",
+        isConnected: true, selectedName: "Standard", autoSavedAt: nil,
+        profiles: [.init(name: "Standard", spaceCount: 6, windowCount: 14),
+                   .init(name: "Solo", spaceCount: 1, windowCount: 1)])])
 }
 settings.reload()
-// The content lives inside a scroll view now, so measure the stack itself — the scroll view's
-// own size is the window's, which is exactly the thing being capped.
-if let content = settings.contentStack {
-    content.layoutSubtreeIfNeeded()
-    let fitting = content.fittingSize
+
+func descendants(_ view: NSView) -> [NSView] {
+    view.subviews + view.subviews.flatMap(descendants)
+}
+func headings(_ pane: NSStackView) -> [String] {
+    pane.arrangedSubviews.compactMap { $0 as? NSTextField }
+        .filter { $0.font?.pointSize == 13 }.map(\.stringValue)
+}
+
+// The single column this replaced was 1170pt tall — more than a 16" MacBook shows.
+let settingsTabs = settings.window?.contentViewController as? NSTabViewController
+let tabItems = settingsTabs?.tabViewItems ?? []
+let paneNames = ["General", "Shortcuts", "Experimental"]
+expect(settingsTabs?.tabStyle == .toolbar && settings.window?.toolbarStyle == .preference,
+       "the tabs are a toolbar, in the settings-window style")
+expect(tabItems.map(\.label) == paneNames, "General, Shortcuts, Experimental, in that order")
+expect(tabItems.allSatisfy { $0.image != nil }, "every tab has an icon that resolves")
+expect(settings.window?.styleMask.contains(.resizable) == false,
+       "the window is not user-resizable: each pane sets its size")
+
+if settings.panes.count == paneNames.count, tabItems.count == paneNames.count,
+   let settingsWindow = settings.window {
     let expected = SettingsWindowController.contentWidth + 40   // 20pt inset each side
 
-    expect(abs(fitting.width - expected) < 1,
-           "content is \(Int(expected))pt wide, not stretched by a long label "
-           + "(got \(Int(fitting.width)))")
+    for (index, content) in settings.panes.enumerated() {
+        let name = paneNames[index]
+        content.layoutSubtreeIfNeeded()
+        let fitting = content.fittingSize
 
-    var overflowing: [String] = []
-    func walk(_ view: NSView) {
-        for sub in view.subviews {
-            let frame = view.convert(sub.frame, to: content)
-            if frame.maxX > fitting.width + 0.5 || frame.minX < -0.5 {
-                overflowing.append((sub as? NSTextField).map { String($0.stringValue.prefix(40)) }
-                                   ?? "\(type(of: sub))")
+        expect(abs(fitting.width - expected) < 1,
+               "\(name) is \(Int(expected))pt wide, not stretched by a long label and no "
+               + "narrower than the other panes (got \(Int(fitting.width)))")
+        expect(fitting.height <= 700,
+               "\(name) is \(Int(fitting.height))pt tall — it fits a laptop screen")
+        expect(tabItems[index].viewController?.preferredContentSize == fitting,
+               "\(name)'s tab is exactly the size of its content, so nothing scrolls")
+
+        var overflowing: [String] = []
+        func walk(_ view: NSView) {
+            for sub in view.subviews {
+                let frame = view.convert(sub.frame, to: content)
+                if frame.maxX > fitting.width + 0.5 || frame.minX < -0.5 {
+                    overflowing.append((sub as? NSTextField).map { String($0.stringValue.prefix(40)) }
+                                       ?? "\(type(of: sub))")
+                }
+                walk(sub)
             }
-            walk(sub)
+        }
+        walk(content)
+        expect(overflowing.isEmpty,
+               "nothing in \(name) extends past the content bounds"
+               + (overflowing.isEmpty ? "" : " — \(overflowing.joined(separator: "; "))"))
+
+        // A clipped wrapping label is exactly one line tall; a wrapped one is taller.
+        let wrapping = content.subviews.compactMap { $0 as? NSTextField }
+            .filter { $0.maximumNumberOfLines == 0 }
+        expect(!wrapping.isEmpty, "found \(name)'s wrapping labels")
+        for field in wrapping {
+            let needed = field.cell?.cellSize(forBounds: NSRect(
+                x: 0, y: 0, width: field.frame.width, height: .greatestFiniteMagnitude)).height ?? 0
+            expect(field.frame.height >= needed - 0.5,
+                   "\"\(field.stringValue.prefix(30))…\" is \(Int(field.frame.height))pt, "
+                   + "needs \(Int(needed))pt")
         }
     }
-    walk(content)
-    expect(overflowing.isEmpty,
-           "nothing extends past the content bounds"
-           + (overflowing.isEmpty ? "" : " — \(overflowing.joined(separator: "; "))"))
 
-    // A clipped wrapping label is exactly one line tall; a wrapped one is taller.
-    let wrapping = content.subviews.compactMap { $0 as? NSTextField }
-        .filter { $0.maximumNumberOfLines == 0 }
-    expect(!wrapping.isEmpty, "found the wrapping labels")
-    for field in wrapping {
-        let needed = field.cell?.cellSize(forBounds: NSRect(
-            x: 0, y: 0, width: field.frame.width, height: .greatestFiniteMagnitude)).height ?? 0
-        expect(field.frame.height >= needed - 0.5,
-               "\"\(field.stringValue.prefix(30))…\" is \(Int(field.frame.height))pt, "
-               + "needs \(Int(needed))pt")
+    expect(settingsWindow.contentLayoutRect.size
+           == tabItems[0].viewController?.preferredContentSize,
+           "the window opens at the size of the selected pane")
+    // AppKit does the resize on tab change itself, a turn of the run loop later.
+    if NSScreen.main != nil {
+        settingsTabs?.selectedTabViewItemIndex = 1
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        expect(settingsWindow.contentLayoutRect.size
+               == tabItems[1].viewController?.preferredContentSize,
+               "switching tabs resizes the window to the new pane")
+        settingsTabs?.selectedTabViewItemIndex = 0
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+    } else {
+        print("  skip  no display attached (CI) — the resize on tab change needs a real screen")
     }
 
     // The old rule — "the window must be as tall as its content" — is what produced a window
     // taller than the screen, with the buttons below the bottom edge where no amount of
-    // scrolling could reach them.
-    let visible = (settings.window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 900
-    expect((settings.window?.frame.height ?? 0) <= visible,
-           "window never exceeds the screen, so nothing is cut off the bottom")
-    if let scroll = settings.window?.contentView as? NSScrollView {
-        expect(scroll.documentView === content, "the content scrolls instead of overflowing")
-        expect(scroll.hasVerticalScroller, "and there is a scroller to do it with")
-    } else {
-        expect(false, "settings content is inside a scroll view")
-    }
-    expect(settings.window?.styleMask.contains(.resizable) == true,
-           "and the window can be dragged taller")
+    // scrolling could reach them. Enough displays can still do that to Levels, and that is
+    // the one case where a pane scrolls.
+    levelRows = 80
+    settings.reload()
+    let visible = (settingsWindow.screen ?? NSScreen.main)?.visibleFrame.height ?? 900
+    expect(settingsWindow.frame.height <= visible,
+           "80 levels: the window stops at the screen, so nothing is cut off the bottom")
+    expect((tabItems[0].viewController?.preferredContentSize.height ?? 0)
+           < settings.panes[0].fittingSize.height
+           && (tabItems[0].viewController?.view as? NSScrollView)?.hasVerticalScroller == true,
+           "…and the pane scrolls instead of overflowing")
+    levelRows = 4
+    settings.reload()
 
-    func descendants(_ view: NSView) -> [NSView] {
-        view.subviews + view.subviews.flatMap(descendants)
-    }
-    let settingsViews = descendants(content)
-    let labels = settingsViews.compactMap { $0 as? NSTextField }.map(\.stringValue)
-    let buttons = settingsViews.compactMap { $0 as? NSButton }
-    func button(_ title: String) -> NSButton? { buttons.first { $0.title == title } }
-    expect(labels.contains("Space Layout Protection — Experimental"),
-           "Space protection is visibly marked Experimental in Settings")
-    let experimentalHeadingIndex = content.arrangedSubviews.firstIndex {
-        ($0 as? NSTextField)?.stringValue == "Space Layout Protection — Experimental"
-    }
-    let appPauseButtonsIndex = content.arrangedSubviews.firstIndex { view in
-        descendants(view).contains {
-            ($0 as? NSButton)?.title == "Add App…"
+    // MARK: General
+
+    let general = settings.panes[0]
+    expect(headings(general)
+           == ["Levels", "Pause the boost for these apps", "HDR trigger corner"],
+           "General holds the levels, the app-pause list and the trigger corner, in that order")
+
+    let levelFields = descendants(general).compactMap { $0 as? PercentField }
+    let units = descendants(general).compactMap { $0 as? NSTextField }.filter { $0.stringValue == "%" }
+    expect(levelFields.count == 4 && units.count == 4, "every level field is followed by a % unit")
+
+    // The popup's titles and the stored corner values are parallel lists. Reordering the
+    // titles without the values would silently park the EDR trigger in the wrong corner, and
+    // nothing would report an error — the pixel would just show up somewhere visible.
+    expect(SettingsWindowController.corners.first == "topRight",
+           "top right is the default, so an unset pref lands on popup index 0")
+    if let popup = descendants(general).compactMap({ $0 as? NSPopUpButton }).first {
+        expect(popup.numberOfItems == SettingsWindowController.corners.count,
+               "one title per stored value")
+        for (index, value) in SettingsWindowController.corners.enumerated()
+        where index < popup.numberOfItems {
+            let title = popup.item(at: index)?.title ?? ""
+            expect(title.lowercased().replacingOccurrences(of: " ", with: "") == value.lowercased(),
+                   "popup item \(index) \"\(title)\" stores \"\(value)\"")
         }
+    } else {
+        expect(false, "found the trigger-corner popup")
     }
-    expect(experimentalHeadingIndex != nil && appPauseButtonsIndex != nil
-           && experimentalHeadingIndex! > appPauseButtonsIndex!,
-           "the complete Experimental section is below the app-pause controls")
+
+    // Reverting on end-of-editing silently threw away whatever had been typed unless it was
+    // followed by Return. These drive the real field editor; the window is never shown.
+    if levelFields.count == 4 {
+        let field = levelFields[1]   // LG brightness: starts at 50, stops at 100
+        func type(_ text: String) {
+            settingsWindow.makeFirstResponder(field)
+            field.currentEditor()?.string = text
+        }
+        func press(_ command: Selector) {
+            guard let editor = field.currentEditor() as? NSTextView else { return }
+            _ = settings.control(field, textView: editor, doCommandBy: command)
+        }
+
+        type("40")
+        settingsWindow.makeFirstResponder(nil)
+        expect(appliedLevels == [0.4] && field.stringValue == "40",
+               "a level commits when focus leaves the field (Tab or click-away), not only on Return")
+
+        appliedLevels = []
+        type("500")
+        press(#selector(NSResponder.insertNewline(_:)))
+        settings.controlTextDidEndEditing(
+            Notification(name: NSControl.textDidEndEditingNotification, object: field))
+        expect(appliedLevels == [1.0] && field.stringValue == "100",
+               "Return applies the clamped value once; the end of editing after it does not re-apply")
+
+        appliedLevels = []
+        type("7")
+        press(#selector(NSResponder.cancelOperation(_:)))
+        settingsWindow.makeFirstResponder(nil)
+        expect(appliedLevels.isEmpty && field.stringValue == "100", "Escape still reverts")
+
+        type("abc")
+        settingsWindow.makeFirstResponder(nil)
+        expect(appliedLevels.isEmpty && field.stringValue == "100",
+               "an entry with no number in it is put back, not applied")
+
+        settingsWindow.makeFirstResponder(field)
+        settingsWindow.makeFirstResponder(nil)
+        expect(appliedLevels.isEmpty, "a field that held the focus but was not typed in applies nothing")
+
+        type("1")
+        settings.reload()
+        expect(appliedLevels.isEmpty,
+               "a reload mid-edit drops the half-typed entry instead of applying it")
+    }
+
+    // MARK: Shortcuts
+
+    let recorders = descendants(settings.panes[1]).compactMap { $0 as? ShortcutRecorder }
+    expect(recorders.count == ShortcutAction.allCases.count, "Shortcuts holds one recorder per action")
+
+    // MARK: Experimental
+
+    let experimental = settings.panes[2]
+    let buttons = settings.panes.map { pane in descendants(pane).compactMap { $0 as? NSButton } }
+    func button(_ title: String) -> NSButton? { buttons[2].first { $0.title == title } }
+    expect(headings(experimental).first == "Space Layout Protection — Experimental"
+           && (experimental.arrangedSubviews.first as? NSTextField)?.textColor == .systemOrange,
+           "Space protection is visibly marked Experimental at the top of its own pane")
+    expect(buttons[0].contains { $0.title == "Add App…" }
+           && !(buttons[0] + buttons[1]).contains { $0.title.contains("Space")
+               || $0.title.contains("Restore") || $0.title.contains("Fullscreen") },
+           "every Space control is in the Experimental pane, away from the everyday ones")
     expect(button("Enable Experimental Space Writes")?.state == .off,
            "the Settings write opt-in renders off by default")
     expect(button("Automatically Restore Layouts")?.isEnabled == false,
@@ -286,30 +414,70 @@ if let content = settings.contentStack {
            && button("Convert Fullscreen Apps to Dedicated Desktops…")?.isEnabled == true,
            "write controls become available only after the explicit Settings opt-in")
 
-    // The popup's titles and the stored corner values are parallel lists. Reordering the
-    // titles without the values would silently park the EDR trigger in the wrong corner, and
-    // nothing would report an error — the pixel would just show up somewhere visible.
-    func findPopup(_ view: NSView) -> NSPopUpButton? {
-        if let popup = view as? NSPopUpButton { return popup }
-        for sub in view.subviews { if let popup = findPopup(sub) { return popup } }
-        return nil
-    }
-    expect(SettingsWindowController.corners.first == "topRight",
-           "top right is the default, so an unset pref lands on popup index 0")
-    if let popup = findPopup(content) {
-        expect(popup.numberOfItems == SettingsWindowController.corners.count,
-               "one title per stored value")
-        for (index, value) in SettingsWindowController.corners.enumerated()
-        where index < popup.numberOfItems {
-            let title = popup.item(at: index)?.title ?? ""
-            expect(title.lowercased().replacingOccurrences(of: " ", with: "") == value.lowercased(),
-                   "popup item \(index) \"\(title)\" stores \"\(value)\"")
-        }
-    } else {
-        expect(false, "found the trigger-corner popup")
-    }
+    expect(settings.profileRows.map(\.label)
+           == ["   Auto-saved — nothing recorded yet",
+               "● Standard — 6 desktops, 14 windows",
+               "   Solo — 1 desktop, 1 window"],
+           "profile rows count in real plurals, not \"desktop(s)\"")
 } else {
-    expect(false, "settings window has a content view")
+    expect(false, "settings window has its three panes")
+}
+
+// The excluded list is stored, and scripted, as bundle IDs — which is not what anyone calls
+// an app. An ID for an app that is not on this Mac is still a legitimate entry.
+section("Settings — excluded apps are listed by name")
+let unknownApp = "com.example.kelvinxdr.not-installed"
+expect(SettingsWindowController.app(for: unknownApp).name == unknownApp,
+       "an app that cannot be found keeps its bundle ID rather than vanishing")
+let finderName = SettingsWindowController.app(for: "com.apple.finder").name
+expect(!finderName.isEmpty && finderName != "com.apple.finder",
+       "an installed app is shown by its display name (\"\(finderName)\")")
+
+// Recording used to start whenever the recorder became first responder, so Tab landed on it,
+// armed it, and could not leave: Tab has no modifier, which a recording refuses with a beep.
+section("ShortcutRecorder — a click arms it, focus does not")
+if let recorder = (settings.panes.count > 1 ? descendants(settings.panes[1]) : [])
+    .compactMap({ $0 as? ShortcutRecorder }).first, let window = settings.window {
+    settingsTabs?.selectedTabViewItemIndex = 1
+    // Replaces the handler that stores the shortcut, so nothing here reaches UserDefaults.
+    var recorded: [Shortcut?] = []
+    recorder.onChange = { recorded.append($0) }
+
+    func key(_ code: Int, _ characters: String, _ flags: NSEvent.ModifierFlags = []) -> NSEvent {
+        NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0,
+                         windowNumber: window.windowNumber, context: nil, characters: characters,
+                         charactersIgnoringModifiers: characters, isARepeat: false,
+                         keyCode: UInt16(code))!
+    }
+    let click = NSEvent.mouseEvent(with: .leftMouseDown, location: .zero, modifierFlags: [],
+                                   timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                                   eventNumber: 0, clickCount: 1, pressure: 1)!
+    let commandW = key(kVK_ANSI_W, "w", .command)
+
+    window.makeFirstResponder(recorder)
+    expect(window.firstResponder === recorder && !recorder.recording,
+           "keyboard focus reaches the recorder without starting a recording")
+    expect(!recorder.performKeyEquivalent(with: commandW) && recorded.isEmpty,
+           "⌘W on a merely focused recorder is left for the menu, where it closes the window")
+    recorder.keyDown(with: key(kVK_Tab, "\t"))
+    expect(window.firstResponder !== recorder, "Tab moves on past it")
+
+    recorder.mouseDown(with: click)
+    expect(window.firstResponder === recorder && recorder.recording, "a click starts recording")
+    expect(recorder.performKeyEquivalent(with: commandW)
+           && recorded == [Shortcut(keyCode: UInt32(kVK_ANSI_W), modifiers: UInt32(cmdKey))]
+           && !recorder.recording,
+           "⌘W while recording is recorded, not sent to the menu")
+
+    recorder.mouseDown(with: click)
+    settings.windowWillClose(Notification(name: NSWindow.willCloseNotification, object: window))
+    expect(!recorder.recording, "closing the window disarms a recorder that was still waiting")
+
+    recorder.mouseDown(with: click)
+    settingsTabs?.selectedTabViewItemIndex = 0
+    expect(!recorder.recording, "so does switching to another tab")
+} else {
+    expect(false, "found a shortcut recorder")
 }
 
 // MARK: - Media key modifiers
