@@ -430,6 +430,21 @@ binds([(0, "Left"), (0, "Right")], [(0, "Unnamed")], [nil, nil],
       "one service and two screens it could belong to: no guess")
 binds([(0, "DELL U2720Q")], [], [nil], "no services, no bind")
 
+// A bind that did not come from the serial is an inference. Behind a dock that drops the I2C
+// channel it produced a DDC display whose slider moved nothing, where the same monitor used to
+// get the shade overlay — which at least dims.
+section("DDC — an inferred bind has to answer before it is trusted")
+expect(DDC.drives(screenSerial: 111, serviceSerial: 111, answered: false),
+       "a serial match stands even when the first read fails, as it always did")
+expect(DDC.drives(screenSerial: 111, serviceSerial: 111, answered: true),
+       "a serial match that answers is DDC")
+expect(!DDC.drives(screenSerial: 0, serviceSerial: 0, answered: false),
+       "serial 0 on both sides is not a match: silent means the shade, not a dead slider")
+expect(DDC.drives(screenSerial: 0, serviceSerial: 0, answered: true),
+       "a name or leftover bind that answers a brightness read is DDC")
+expect(!DDC.drives(screenSerial: 111, serviceSerial: 222, answered: false),
+       "a bind made despite differing serials has to answer too")
+
 // MARK: - Combined brightness scale
 
 // `brightness` is one 0...1 value whose bottom `softwareFraction` is software dimming; the
@@ -468,8 +483,8 @@ expect(monitor.combined(hardware: 0) == 0.15 && monitor.combined(hardware: 1) ==
 // MARK: - Main menu
 
 // An LSUIElement app with no nib has no main menu, and key equivalents resolve against the
-// main menu whether or not it is ever drawn — so ⌘W, ⌘Q and the editing shortcuts were dead
-// in the Settings window and the layout-name prompt.
+// main menu whether or not it is ever drawn — so ⌘W and the editing shortcuts were dead in the
+// Settings window and the layout-name prompt.
 section("Main menu — the shortcuts a menu-bar app does not get for free")
 let mainMenu = MainMenu.make()
 let mainMenuItems = mainMenu.items.compactMap { $0.submenu }.flatMap { $0.items }
@@ -480,7 +495,6 @@ func shortcut(_ key: String, _ modifiers: NSEvent.ModifierFlags = .command,
     }
     expect(item?.action == NSSelectorFromString(action), "\(why) sends \(action)")
 }
-shortcut("q", sends: "terminate:", "⌘Q")
 shortcut("w", sends: "performClose:", "⌘W")
 shortcut("z", sends: "undo:", "⌘Z")
 shortcut("z", [.command, .shift], sends: "redo:", "⇧⌘Z")
@@ -490,8 +504,14 @@ shortcut("v", sends: "paste:", "⌘V")
 shortcut("a", sends: "selectAll:", "⌘A")
 expect(mainMenuItems.allSatisfy { $0.target == nil },
        "every item is nil-targeted, so it reaches whichever window and field has focus")
-expect(mainMenu.items.first?.submenu?.items.contains { $0.keyEquivalent == "q" } == true,
-       "Quit sits in the first submenu, which AppKit treats as the application menu")
+// An accessory app can be the active app with no window while another app's menus are still
+// in the menu bar. ⌘Q there would quit KelvinXDR instead of the app the user is looking at.
+expect(!mainMenuItems.contains {
+    $0.keyEquivalent.lowercased() == "q" || $0.action == #selector(NSApplication.terminate(_:))
+}, "nothing here quits: no ⌘Q and no terminate: item")
+expect(mainMenu.items.first?.submenu?.items.isEmpty == true
+       && mainMenu.items.dropFirst().first?.submenu?.title == "File",
+       "the application-menu slot is kept, empty, so File is not mistaken for it")
 
 // MARK: - System bezel chiclets
 
